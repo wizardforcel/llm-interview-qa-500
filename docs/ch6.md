@@ -4,15 +4,21 @@
 
 ---
 
+> 先把话说清楚：这一章讲的是大模型"跑得快"的底层手艺。同样是这些模型、同样这几块显卡，为什么别家的训练和推理就是快一大截？秘密常常藏在离硬件最近的那层代码里——也就是 CUDA 和 Triton 写的 kernel。你不用担心自己还没写过 CUDA，跟着每题从"它到底在解决什么物理问题"入手，把 GPU 这台机器的脾性摸清楚，后面再看那些框架，会觉得它们不过是在替你做同一批决策。
+
+---
+
 ## Q1. CUDA 的 grid、block、thread 三层结构分别对应硬件的什么？一个 block 内的线程如何共享 shared memory？
 
 **回答**
 
-- **grid**：一次 kernel 启动的所有线程块集合，映射到 GPU 的所有 SM（调度粒度）；
-- **block（线程块）**：一组线程，**必须被调度到同一个 SM**（一个 SM 可驻留多个 block），是资源/同步的基本单位；
-- **thread（线程）**：最小的执行单元，物理上每 32 个组成一个 warp 由 SM 的调度器发射。
+CUDA 的并行是"分三层管人"的：最大的叫 grid，中间叫 block，最小的是 thread。三者从上到下依次套娃，各管一摊：
 
-**对应关系**：
+- **grid**：一次 kernel 启动拉起的所有线程块组成一个 grid，它对应到整块 GPU 的所有 SM，也就是"任务级"的并行调度单位；
+- **block（线程块）**：一组线程，**必须被调度到同一个 SM 上**（一个 SM 能同时驻留多个 block）。它是占资源和做同步的基本单位；
+- **thread（线程）**：最小的执行单元，物理上每 32 个线程捆成一个 warp，由 SM 的调度器统一发射执行。
+
+**对应关系**摆成一张表最直观：
 
 | CUDA 三层 | 硬件对应 |
 |---|---|
@@ -20,7 +26,7 @@
 | block | 单个 SM（资源驻留单位） |
 | warp（thread 组） | SM 内一个调度器发射的 32 线程 |
 
-**block 内共享 shared memory**：block 内线程通过 `__shared__` 声明的数组共享——它们在同一个 SM 的片上 SRAM，通过 `__syncthreads()` 同步后互相读写；不同 block 的 shared memory 相互隔离（不共享）。
+**block 内怎么共享 shared memory**：block 里的线程通过 `__shared__` 声明的数组来共享数据——这块数组就落在该 block 所在 SM 的片上 SRAM 里，写完调用 `__syncthreads()` 同步一下，别的线程就能读到；不同 block 各自一份，互相隔离，谁也看不到谁。
 
 ```cuda
 // CUDA 示意：block 内共享
@@ -44,7 +50,7 @@ flowchart TB
     E --> H["__shared__ 数组（block内共享）"]
 ```
 
-**面试要点**：grid=GPU，block=SM，thread（warp）=调度发射单元；`__shared__`+`__syncthreads` 是 block 内共享的关键。
+**面试要点**：记住一句话——grid 对应整块 GPU，block 对应单个 SM，thread（warp）是调度发射单元；而 block 内共享靠 `__shared__` 加 `__syncthreads`。
 
 ---
 
@@ -52,16 +58,16 @@ flowchart TB
 
 **回答**
 
-**判断框架**（三个维度：性能需求、可控性、工程成本）：
+这道题其实是在问"什么时候值不值得自己下场造轮子"。判断框架可以挂在三个维度上：**性能需求、可控性、工程成本**。
 
-- **用 Triton 就够了**：
-  - 常规 GEMM/attention/elementwise/norm，性能需求"接近手动即可"（85–95% cuBLAS/Flash 在多数场景够）；
-  - 需要快速迭代/实验、可移植性（同一 kernel 跑多 GPU）；
-  - 不希望手写并行调度/寄存器分配。
-- **需要手写 CUDA**：
-  - **bottom-line 极致性能**：追求 99% 算力峰值、特殊布局/指令（TMA、warp-specialization 精细编排、自定义 MMA）；
-  - **硬件特性未暴露给 Triton**：寄存器级精细控制、特殊 pipeline、非标数据摆放（swizzle 需要自定义）、稀疏/特殊指令；
-  - **调试/可移植受限**：某些 CLI 环境下 Triton 的依赖难装，或需要嵌入 C++ 运行时。
+- **Triton 就够了的情况**：
+  - 常规的 GEMM、attention、elementwise、norm 这类算子，性能只要"接近手写"即可（这类场景下冲到 cuBLAS/Flash 的 85–95% 通常已经够用）；
+  - 需要快速迭代、反复做实验，或者希望一份 kernel 能跑多种 GPU（可移植性优先）；
+  - 不想自己操心并行调度、寄存器分配这些脏活。
+- **需要手写 CUDA 的情况**：
+  - 冲着**极限性能**去的：想压到 99% 算力峰值，或要用 TMA、warp specialization 这类精细编排、自定义 MMA 指令；
+  - Triton 还没暴露给你的硬件特性：寄存器级精细控制、特殊 pipeline、非标准数据摆放（自定义 swizzle）、稀疏/特殊指令；
+  - 调试或可移植性受限：某些命令行环境下 Triton 的依赖难装，或者需要把代码嵌进 C++ 运行时。
 
 ```python
 def choose(need_speed, need_control, iter_speed):
@@ -82,7 +88,7 @@ flowchart TB
     E --> F["混合: 热点手写CUDA + 常规Triton"]
 ```
 
-**面试要点**：性能/控制需求高 + 特殊硬件特性 → CUDA；快速开发 + 常规算子 → Triton；多数生产是"热点手写 + 常规 Triton"混合。
+**面试要点**：性能和控制需求高、又要用到特殊硬件特性 → 手写 CUDA；快速开发、常规算子 → Triton；而多数生产环境其实是"热点那几块手写 + 其余 Triton"的混合打法。
 
 ---
 
@@ -90,17 +96,19 @@ flowchart TB
 
 **回答**
 
-- **CUDA 全局访问**：程序员显式写指针解引用 `in[i + tid]`，自己负责**coalescing（合并访问）、对齐、布局、同步**；
-- **Triton 的 `tl.load(ptr + offset, mask, other)`**：面向**张量（tile）级**的操作——你声明"加载一段 block 数据"，**编译器自动**：
-  1. 推导**内存访问模式**（是否 coalesced，自动向量化）；
-  2. 管理 **block 内并行（每线程处理哪些元素）**；
-  3. 生成 **布局/复用的优化**（对 tile 加载做 swizzle、复用等）；
-  4. 插入同步与 barrier（需要时）。
+同样是读全局内存，两者站的高度完全不同：
 
-**Triton 替你做的关键优化决策**：
-- 线程/数据映射（每线程多元素、循环展开）；
-- 从全局到共享/寄存器的 staging 决策、tile 复用；
-- coalescing 与对齐；自动选择 BLOCK 与 num_warps（或 autotune）。
+- **CUDA 的全局访问**：你自己写指针解引用 `in[i + tid]`，那 coalescing（合并访问）、对齐、布局、同步，统统要自己负责；
+- **Triton 的 `tl.load(ptr + offset, mask, other)`**：你面对的是**张量（tile）级**的东西——只需声明"我要加载一段 block 数据"，剩下的**编译器自动**替你做：
+  1. 推导**内存访问模式**（是不是 coalesced，能不能自动向量化）；
+  2. 管理 **block 内并行**（每个线程分到哪些元素）；
+  3. 生成**布局/复用的优化**（对 tile 加载做 swizzle、复用等）；
+  4. 需要时插入同步与 barrier。
+
+**Triton 替你拍板的关键决策**有这些：
+- 线程与数据的对应关系（每线程处理几个元素、循环怎么展开）；
+- 从全局到共享/寄存器的 staging 决策、tile 要不要复用；
+- coalescing 与对齐；BLOCK 与 num_warps 的自动选择（或交给 autotune）。
 
 ```python
 import triton
@@ -122,7 +130,7 @@ flowchart LR
     E["手写CUDA"] --> F["线程级逐元素 + 自己管合并/同步"]
 ```
 
-**面试要点**：Triton 抽象到"**张量块**"，把**映射、coalescing、布局、复用**交给编译器；CUDA 则要自己处理线程级细节。
+**面试要点**：Triton 把抽象抬到"**张量块**"，把映射、coalescing、布局、复用这些活交给编译器；CUDA 则要你自己处理线程级细节。这是"省心"和"掌控"的取舍。
 
 ---
 
@@ -130,14 +138,14 @@ flowchart LR
 
 **回答**
 
-**tiling 提升性能**：GEMM `C = A×B` 中，数据复用量大（A 的行被多个 B 列复用、B 的列被多个 A 行复用）。用**共享内存分块**：每次把一个 tile 的 A/B 装进共享内存，片上复用它做所有需要的 MAC——**减少 HBM 访问**（Q13 第 5 章），让计算不被带宽饿死。
+**为什么 tiling 能提速**：GEMM `C = A×B` 的数据复用非常大（A 的一行会被多个 B 列反复用，B 的一列也会被多个 A 行反复用）。用共享内存分块，就是每次只把一个 tile 的 A/B 装进片上内存，然后在这一小块里反复做 MAC 运算——**少跑几趟 HBM**（对应第 5 章 Q13），计算就不会被内存带宽饿着。
 
-**Bank conflict**：共享内存是**按字长（bank）组织的物理存储**（如 32 个 bank，每个 4B）。如果**一个 warp 内同一时刻多个线程访问同一 bank 的不同地址**（地址差恰为 bank 数整数倍），硬件必须串行化 → 一次访问变多次（bandwidth 受损）。极端 32 线程同一 bank → 32-way conflict → 慢 32 倍。
+**Bank conflict 是什么**：共享内存是按字长（bank）组织的物理存储（常见 32 个 bank，每个 4B）。如果**一个 warp 里同一时刻有多个线程去访问同一个 bank 的不同地址**（地址差恰好是 bank 数的整数倍），硬件没法一次办好，只能串行化——本来一次访问，硬生生拆成好几次，带宽白白受损。极端情况下 32 个线程全挤在一个 bank，就是 32-way conflict，直接慢 32 倍。
 
-**避免**：
-- **padding**：`s[B][B+1]` 加 1 个元素错开地址（经典技巧）——但会浪费一点；或者用 **访问模式的 swizzle/对角线偏移**；
-- 让不同线程访问**不同 bank**（地址分散到不同 bank，不撞车）；
-- 使用 float4/向量化访问把每线程读更多 bank。
+**怎么避免**：
+- **padding**：把数组开成 `s[B][B+1]`，多补一个元素把地址错开（经典技巧）——代价是浪费一点空间；或者用**访问模式上的 swizzle/对角线偏移**；
+- 让不同线程落到**不同的 bank** 上（地址尽量分散，别撞车）；
+- 用 float4 等向量化访问，让每个线程一次读更多 bank。
 
 ```python
 # bank 冲突示意: 地址 = row*B + col; 若 B=32, 32线程同col → 同bank冲突
@@ -161,7 +169,7 @@ flowchart TB
     D --> E["避免: padding / swizzle / 分散访问"]
 ```
 
-**面试要点**：tiling = 共享内存复用降 HBM；bank conflict = 同 bank 异址被串行化；避免手段 padding + 访问分散。
+**面试要点**：tiling 是靠共享内存复用来少走 HBM；bank conflict 是同 bank 异址被逼着串行化；破解手段就是 padding 加让访问分散开。
 
 ---
 
@@ -169,13 +177,14 @@ flowchart TB
 
 **回答**
 
-**角色**：
-- `__shfl_sync(mask, val, lane)`：在**一个 warp 内**广播/换位共享值，**不需要 shared memory 与 __syncthreads**——FlashAttention 里被用来做 **跨线程的局部 reduction（max/sum）**：每个线程算自己 lane 的局部 max，然后 `shfl` 快速合并 warp 内所有 lane 的值（`warp_reduce`）;
-- `__ballot_sync(mask, pred)`：收集 warp 内所有线程的谓词位，得到 32-bit mask——Flash 中用于实现"**块结束/对齐判断**"、条件分支的集合决策（如判断当前是否越界）。
+先看这俩原语各干什么活：
 
-**没有它们哪些会变慢**：
-- **warp 内 reduction 必须走 shared memory + `__syncthreads()`**：每轮 max/sum 都要写共享内存、同步、再读——多了两次访存与 barrier，Flash 的循环几乎每步都做 reduction，于是**性能显著下降**（bandwidth 增加 + serial 化）；
-- 分支/掩码判断要走全局内存或更多指令，增加寄存器压力。
+- `__shfl_sync(mask, val, lane)`：在**一个 warp 内部**广播或换位共享值，**既不占共享内存、也不用 `__syncthreads`**。FlashAttention 里就用它来做**跨线程的局部 reduction（max/sum）**——每个线程先算自己 lane 的局部 max，然后用 `shfl` 一把合并 warp 内所有 lane 的值（也就是常说的 `warp_reduce`）；
+- `__ballot_sync(mask, pred)`：收集 warp 内所有线程的谓词位，凑成一个 32 位的 mask——Flash 里用它来判断"**块是不是结束了、对不对齐**"，以及做条件分支的集合决策（比如判断当前有没有越界）。
+
+**没有它们会慢在哪**：
+- **warp 内的 reduction 只能退回去走共享内存 + `__syncthreads()`**：每一轮 max/sum 都得写共享内存、同步、再读回来，平白多两次访存加一个 barrier。Flash 的循环几乎每一步都在做 reduction，这一来**性能下降就很显著**（带宽增加、还串行化）；
+- 分支和掩码判断得绕更多指令甚至走全局内存，寄存器压力也跟着变大。
 
 ```cuda
 // 示例：warp 内 max reduction（shfl 闪电级）
@@ -196,7 +205,7 @@ flowchart LR
     C --> F["__ballot_sync: 块级谓词决策"]
 ```
 
-**面试要点**：shfl 做 **warp 内 reduction**（无 shared/同步），ballot 做**谓词收集**；无它们=每轮走 shared+同步，Flash 的每步 reduction 变慢。
+**面试要点**：shfl 负责 **warp 内 reduction**（不走共享内存、不用同步），ballot 负责**谓词收集**；一旦没有它们，每轮 reduction 就得走共享内存加同步，Flash 这种步步都在 reduction 的写法会被拖慢。
 
 ---
 
@@ -204,18 +213,18 @@ flowchart LR
 
 **回答**
 
-**寄存器溢出**：kernel 需要的寄存器超过每线程上限 → 编译器把溢出变量**压到 local memory（物理上在 HBM）**。访问延迟从 ~1 周期涨到 ~500 周期（Q25 第 5 章），且每次读写都付带宽 → 性能雪崩。
+**寄存器溢出是怎么回事**：kernel 需要的寄存器数超过了每个线程的上限，编译器只好把装不下的变量**挤到 local memory** 去——而 local memory 物理上就在 HBM 里。这一挤，访问延迟从约 1 个周期暴涨到约 500 个周期（对应第 5 章），而且每次读写都要付费走带宽，性能可以说是一泻千里。
 
-**检测**：
-- 编译输出（PTX）中的 `spill` 统计：`ptxas -v` / CUDA 编译日志里的 "2 spill stores, 2 spill loads"；
-- profiler（ncu）看 local memory 的访问量；寄存器使用率mailto。
+**怎么检测**：
+- 看编译输出（PTX）里的 `spill` 统计：用 `ptxas -v` 或 CUDA 编译日志，会打出类似 "2 spill stores, 2 spill loads" 的字样；
+- 用 profiler（ncu）看 local memory 的访问量，以及寄存器使用率。
 
-**缓解**：
-1. **减少每线程寄存器用量**：调小 tile/块大小（`BLOCK`、`num_warps`）、减少局部临时变量、复用变量；
-2. **`__launch_bounds__` 强制上限**（但会导致 spill 显性化，需权衡）；
-3. **maxrregcount 编译选项**；
-4. **简化核心循环**：把大的中间结果尽量用共享内存/重复计算避免长生命周期的寄存器压力；
-5. 若 Triton：调 `num_warps`、`num_stages`、BLOCK*D 的组合让编译器平衡。
+**怎么缓解**：
+1. **降低每线程的寄存器用量**：调小 tile/块大小（`BLOCK`、`num_warps`），少用局部临时变量，能复用的变量就复用；
+2. **用 `__launch_bounds__` 强制设个上限**（但这会把溢出问题显性化，得权衡着来）；
+3. **用 maxrregcount 编译选项**限寄存器数；
+4. **简化核心循环**：大的中间结果尽量放共享内存，或用重复计算换来短生命周期的寄存器；
+5. 如果是 Triton：调 `num_warps`、`num_stages`、BLOCK*D 的组合，让编译器自己找平衡。
 
 ```python
 # Triton 中缓解:
@@ -233,7 +242,7 @@ flowchart LR
     D --> E["缓解: 小tile/__launch_bounds__/maxrregcount/减少变量"]
 ```
 
-**面试要点**：溢出=变量落 HBM（~500 周期）→ 灾难；检测=编译 spill 统计+ profiler；缓解=调 tile/寄存器上限/变量复用。
+**面试要点**：溢出的本质是变量被迫落到 HBM（~500 周期），所以是灾难；检测看编译器的 spill 统计加 profiler；缓解就调 tile、设寄存器上限、做变量复用。
 
 ---
 
@@ -241,17 +250,17 @@ flowchart LR
 
 **回答**
 
-**解决的问题**：**隐藏"加载→计算"的串行缺口**。传统模式是"**load（全局→共享）→ __syncthreads → compute**"，加载阶段 SM 空闲等数据——访存延迟没有与计算重叠。
+**它要解决的，是"加载→计算"之间那道串行的空档**。传统写法是"**load（全局→共享）→ `__syncthreads` → compute**"，加载数据的那段时间 SM 只能干等着——访存延迟压根没和计算重叠起来。
 
-**cp.async（Ampere+，异步复制到共享内存）**：
-- 把"全局内存 → 共享内存"的拷贝**发给异步引擎**，不占用 SM 的寄存器/指令槽；
-- SM 在等待异步拷贝完成的同时可以**做计算**（重叠），用 `cp.async.commit_group`/`wait_group` 显式管理批次；
-- 效果：**加载与计算流水线化**（double-buffering 更容易），显著提高 tensor 密集 kernel（GEMM/attention）的带宽利用。
+**cp.async（Ampere 及以后，异步复制到共享内存）**做了这么几件事：
+- 把"全局内存 → 共享内存"的拷贝**甩给异步引擎**，不占用 SM 的寄存器和指令槽；
+- SM 在等异步拷贝完成的工夫里，可以顺手**去做计算**（两者重叠），并用 `cp.async.commit_group` / `wait_group` 显式管理批次；
+- 效果就是把**加载和计算流水线化**了（双重缓冲也更好实现），tensor 密集的 GEMM/attention 带宽利用率显著提高。
 
-**TMA（Hopper，Tensor Memory Accelerator）**：
-- 进一步把**多维 tensor 的块拷贝 + 自动 swizzle/布局**也交给硬件，CPU/驱动更低介入——支持 block 化的多维传输，程序员给"box 描述"即可。
+**TMA（Hopper 上的 Tensor Memory Accelerator）**更进一步：
+- 把**多维 tensor 的块拷贝、自动 swizzle/布局**也交给硬件，CPU 和驱动的介入更少——它支持按 block 化的多维传输，程序员只要给个"box 描述"就行。
 
-**优势总结**：load 与 compute **重叠**，减少 SM 空等；比"每轮 load→sync→compute"快（尤其 memory-bound kernel）。
+**优势一句话**：load 和 compute **重叠**起来，减少 SM 空等；自然比"每轮 load→sync→compute"快，尤其对 memory-bound 的 kernel。
 
 ```cuda
 // cp.async 示意（伪代码）
@@ -271,7 +280,7 @@ sequenceDiagram
     S->>S: wait_group 后取新数据
 ```
 
-**面试要点**：cp.async/TMA 把**拷贝交给异步引擎**，与计算重叠（double-buffer）；比"load→sync→compute"省空等。
+**面试要点**：cp.async/TMA 把**拷贝交给异步引擎**，让它和计算重叠（靠 double-buffer）；比"load→sync→compute"少了 SM 的空等。
 
 ---
 
@@ -279,12 +288,12 @@ sequenceDiagram
 
 **回答**
 
-**为什么难**：PyTorch 的 `torch.nn.functional.scaled_dot_product_attention`（SDPA）**已经自动选择最优后端**（FlashAttention-2、memory-efficient、math fallback），且经过深度优化（融合 kernel、精确的 tiling/双缓冲/同步）——手写要复刻同等水平非常困难（需要处理块大小、warp-level attention、running softmax、跨 warp reduction、同步、occupancy 优化等细节）。
+**为什么自己写很难更好**：PyTorch 的 `torch.nn.functional.scaled_dot_product_attention`（简称 SDPA）**已经会自动挑最优后端**（FlashAttention-2、memory-efficient、math fallback 都在里面），而且经过深度打磨（融合 kernel、精确的 tiling、双缓冲、同步都调好了）。你要手写复刻到同等水平，非常难——块大小、warp-level attention、running softmax、跨 warp reduction、同步、occupancy 优化，哪一样都得处理到位。
 
-**什么情况仍值得手写**：
-1. **自定义 attention 变体**：sliding window + global、低秩、位置偏置变动、PaLM/I-JEPA 的特殊打分——库没覆盖，必须自己写；
-2. **需要极致/特殊性能**（如超长序列的定制 tiling、混合精度特殊路径）；
-3. **深入理解 + 教学/调优**：需要"读懂并微调" Flash 的行为（kernel 级）时候。
+**但有些情况还是值得自己写**：
+1. **自定义 attention 变体**：sliding window + global、低秩、变体位置偏置，或者 PaLM/I-JEPA 那类特殊打分——库里没覆盖，只能自己写；
+2. **需要极限或特殊的性能**（比如超长序列的定制 tiling、混合精度的特殊路径）；
+3. **想深入理解、做教学或微调**：需要读懂并调到 Flash 的 kernel 级行为时。
 
 ```python
 # SDPA 自动选后端
@@ -302,7 +311,7 @@ flowchart TB
     E --> F["值得手写: 自定义attention/特殊打分/极致调优"]
 ```
 
-**面试要点**：手写要复刻官方 kernel 的全部优化很难；**值得手写的理由 = 自定义变体/特殊需求/深度掌控**。
+**面试要点**：手写要想超过官方，得把 kernel 的全部优化都复刻出来，难度很大；**真正值得动手的理由，是自定义变体、特殊需求，或需要对底层有深度掌控**。
 
 ---
 
@@ -310,14 +319,15 @@ flowchart TB
 
 **回答**
 
-**BLOCK_SIZE 的影响链**：
-- **BLOCK 大** → tile 大 → 每线程处理元素多、共享内存需求大、寄存器压力大 → **occupancy 低**（同一 SM 驻留块少）——但单个块算得"重"；
-- **BLOCK 小** → tile 小 → 每块工作少、shared/寄存器省 → **occupancy 高**——但块边界/调度开销上升。
+`BLOCK_SIZE` 的取值会牵一发动全身，影响链大概是这样：
+
+- **BLOCK 调大** → tile 变大 → 每线程要处理的元素变多、共享内存吃得更多、寄存器压力上升 → **occupancy 变低**（同一个 SM 能同时驻留的块变少）——但单块干的活更"重"；
+- **BLOCK 调小** → tile 变小 → 每块干的活少了、共享内存和寄存器都省 → **occupancy 变高**——但块边界和调度开销跟着涨。
 
 **平衡原则**：
-- 对 **GEMM/attention**：BLOCK 取"能让共享内存装下 A/B/KV tile 且 occupancy ≥ 某个阈值"的尺寸——典型 64/128（按 d 维度）；
-- 需要 **数据的重用性**：BLOCK 太小则复用不足（带宽吃紧）；太大则资源受限（occupancy 低）；
-- 用 **autotune 搜索组合**（BLOCK, num_warps, num_stages）在代表性 shape 上测最优。
+- 对 **GEMM/attention**：BLOCK 要取一个"共享内存装得下 A/B/KV tile、同时 occupancy 还能过某个阈值"的尺寸——常见是 64/128（按 d 维度看）；
+- 要顾到**数据的重用性**：BLOCK 太小重用不够（带宽吃紧），太大资源受限（occupancy 又上不去）；
+- 最稳的办法是用 **autotune 去搜组合**（BLOCK、num_warps、num_stages），在代表性 shape 上实测出最优。
 
 ```python
 # 关系式: 共享内存 per block = 2*BLOCK*d*bytes
@@ -336,7 +346,7 @@ BLOCK= 64: 共享内存≈1024KB → 占用比 0
 BLOCK=128: 共享内存≈2048KB → 占用 0
 ```
 
-（当 BLOCK×d×bytes 超过共享内存容量时 occupancy→0——真实取值要同时受寄存器/共享内存约束，靠 autotune 选。）
+（当 BLOCK×d×bytes 超过共享内存容量时，occupancy 直接掉到 0；真实取值还要同时受寄存器和共享内存两道约束，最后靠 autotune 挑。）
 
 ```mermaid
 flowchart TB
@@ -347,7 +357,7 @@ flowchart TB
     D --> E["autotune 在 (BLOCK,num_warps,num_stages) 上搜索"]
 ```
 
-**面试要点**：BLOCK 在"**复用（带宽）** 与 **occupancy（并发）**"间折中，且受共享内存/寄存器硬约束；用 autotune 找。
+**面试要点**：BLOCK 本质上是在"**复用（省带宽）** 和 **occupancy（提并发）**"之间折中，还受共享内存、寄存器的硬约束，所以拿 autotune 来找最省事。
 
 ---
 
@@ -355,9 +365,9 @@ flowchart TB
 
 **回答**
 
-**Coalesced（合并）访问**：一个 warp 的 32 线程同时访问**连续的地址区间** → 硬件把这批访问**合并成最少的内存事务**。理想情况：32 线程访问连续的 128 字节（每线程 4 字节）→ **1 次内存事务**（128B 对齐段）。
+**Coalesced（合并）访问**：一个 warp 的 32 个线程同时去访问**一段连续的地址**，硬件就把这些访问**合并成尽可能少的内存事务**。最理想的情况：32 个线程访问连续的 128 字节（每线程 4 字节）→ 只需要 **1 次内存事务**（一个 128B 对齐段就搞定）。
 
-**步长为 32 时**（线程 i 访问地址 `base + i*32`）：32 个线程的地址**散布在 32 个不同的 128B 段**（每隔 32×4=128 字节一个）→ 需要 **32 次事务**（每段只用到 4 字节，浪费 96 字节）——带宽利用率 **1/32**。
+**当步长是 32 时**（线程 i 访问地址 `base + i*32`）：32 个线程的地址就**散落到 32 个不同的 128B 段**里了（每隔 32×4=128 字节才有一个）→ 需要发起 **32 次事务**（而每段其实只用了 4 字节，白白浪费 96 字节）——带宽利用率只有 **1/32**。
 
 ```python
 n_transactions = 1           # 连续 128B 对齐
@@ -374,7 +384,7 @@ flowchart LR
     D --> F
 ```
 
-**面试要点**：连续 128B → 1 事务；步长 32 → 32 事务（浪费 96% 带宽）——这就是 coalescing 的重要性。
+**面试要点**：连续 128B 只要 1 次事务；步长 32 要 32 次（浪费 96% 带宽）——coalescing 之所以重要就体现在这里。
 
 ---
 
@@ -382,12 +392,12 @@ flowchart LR
 
 **回答**
 
-**MMA 要求**：
-- shape：按硬件指令，如 `m16n8k16`（A 16×k、B k×8、C 16×8）等——**必须匹配硬件规定的 MMA 形状**；
-- 数据布局：A/B 要求**特定的 ldmatrix / 片段（fragment）分布**（每个线程持有特定位置的元素，寄存器排布固定）——不能任意排；
-- 通常要求**16B 对齐、特定 swizzle**（如 A 用行主序的 k 维度块、B 用列主序等）。
+**MMA 指令的硬要求**：
+- shape：要按硬件规定的形状来，比如 `m16n8k16`（A 16×k、B k×8、C 16×8）这类——**必须精确匹配硬件规定的 MMA 形状**；
+- 数据布局：A/B 要求**特定的 ldmatrix / 片段（fragment）分布**（每个线程持有特定位置的元素，寄存器排布是固定的）——不能随便摆；
+- 通常还要求 **16B 对齐和特定 swizzle**（比如 A 按行主序的 k 维度块、B 按列主序等）。
 
-**为什么需要 swizzle**：共享内存中数据若按"自然"线性排布，MMA 读片段时线程访问地址会**命中 shared memory 的 bank conflict**（Q4）；**swizzle（把数据按 XOR/对角线铺排）** 让每个线程片段读取时访问**分布在不同 bank** → 消除 bank conflict、喂饱 ldmatrix/MMA。
+**为什么需要 swizzle**：共享内存里数据要是按"自然"的线性顺序摆放，MMA 读片段时线程访问的地址很容易撞上共享内存的 bank conflict（见 Q4）；而 **swizzle（把数据按 XOR/对角线铺排）**能让每个线程读片段时，访问**散落到不同的 bank**——这样 bank conflict 就消了，ldmatrix/MMA 也能吃饱数据。
 
 ```python
 # swizzle 概念: XOR 地址混淆让线程片段不撞 bank
@@ -404,7 +414,7 @@ for i in range(4):
 ...
 ```
 
-（真实 swizzle 按 MMA 片段的 16/32 字节单位做对角线混淆。）
+（真实的 swizzle 是按 MMA 片段的 16/32 字节单位做对角线混淆的。）
 
 ```mermaid
 flowchart LR
@@ -414,7 +424,7 @@ flowchart LR
     D --> E["喂饱 Tensor Core"]
 ```
 
-**面试要点**：MMA 按硬件形状 + 固定片段排布；swizzle 让共享内存的读分散到不同 bank、避免冲突。
+**面试要点**：MMA 是按硬件形状加减固定片段排布来的；swizzle 的作用就是把共享内存的读分散到不同 bank，从而避开冲突。
 
 ---
 
@@ -422,13 +432,13 @@ flowchart LR
 
 **回答**
 
-**会（有条件）**：Triton 的 `tl.dot(a, b)` 在**满足条件**时自动映射到 Tensor Core 的 MMA 指令：
+**会映射，但有前提**：Triton 的 `tl.dot(a, b)` 只要**条件满足**，就会自动落到 Tensor Core 的 MMA 指令上。
 
-**条件**：
-1. **shape 匹配**：a/b 的维度符合硬件 MMA 形状（大多是 16 的倍数，k ≥ 16 或更大）；过小会 fallback 到 CUDA core FMA；
-2. **数据类型**：fp16/bf16（或支持的最新混合），FP32 不会走 MMA（除非细粒度混合积）；
-3. **布局/对齐**：a、b 的 tile 布局可由编译器排布成 MMA 需要的 swizzle（自动做），无阻碍；
-4. **`num_warps` 与 BLOCK 匹配**：每块大小足以让一个 warp 做完整 MMA 计算。
+**需要满足的条件**：
+1. **shape 对得上**：a/b 的维度要符合硬件的 MMA 形状（大多要求是 16 的倍数，k ≥ 16 或更大）；太小就会回退到 CUDA core 的 FMA；
+2. **数据类型合适**：fp16/bf16（或硬件支持的最新混合精度）；FP32 不会走 MMA（除非用细粒度混合积之类的特殊路径）；
+3. **布局/对齐允许**：a、b 的 tile 布局能被编译器排成 MMA 需要的 swizzle（这一步它自动做），没有被挡住；
+4. **`num_warps` 与 BLOCK 匹配**：每块的大小要够一个 warp 跑完完整的一次 MMA 计算。
 
 ```python
 @triton.jit
@@ -449,7 +459,7 @@ flowchart LR
     D --> F["慢fallback → 需换shape/dtype"]
 ```
 
-**面试要点**：shape≥16 + fp16/bf16 + 布局可排 → MMA；否则 CUDA core 回退。
+**面试要点**：shape≥16、数据类型是 fp16/bf16、布局排得开 → 走 MMA；否则就退回 CUDA core。
 
 ---
 
@@ -457,13 +467,13 @@ flowchart LR
 
 **回答**
 
-**避免 bank conflict**：
-- **在共享内存 reduction 时**：让每个 warp 读**不同 bank** 的地址——用**相邻 lane 访问相邻地址**（每个线程读自己的 1 元素，天然分散 bank）；若访问跨 stride 则易冲突——用**连续索引 + 每轮步长翻倍只取前半**（`s[i] += s[i+stride]`），保证同一时刻访问的 bank 各不相同；
-- 或用 **`__shfl_down`（warp 内 reduction）**：完全不走 shared memory → 无 bank conflict（Q5 同样技巧）。
+**先躲开 bank conflict**：
+- **在共享内存里做 reduction 时**：让每个 warp 读到**不同 bank** 的地址——办法是用**相邻 lane 访问相邻地址**（每线程读自己的那 1 个元素，天然就散开了）；要是访问跨了 stride，就容易撞车——可以用**连续索引 + 每轮步长翻倍、只取前半段**（`s[i] += s[i+stride]`）的写法，保证同一时刻访问的 bank 各不相同；
+- 或者干脆用 **`__shfl_down`（warp 内 reduction）**：完全不碰共享内存 → 也就没有 bank conflict（和 Q5 是同一套技巧）。
 
-**避免 warp divergence**：
-- reduction 循环的**步长**使**所有线程始终执行相同的分支**（没有 `if (i < half)` 造成的发散——虽然本就在代码里，但要让所有 lane 计算同一个表达式、结果用 mask 忽略）；
-- 不要让不同 thread 走不同代码路径（如 `if (stride==...)` 按 lane 分支）——统一执行 + masked accumulation。
+**再躲开 warp divergence**：
+- 让 reduction 循环的**步长设计成所有线程始终走相同的分支**（不要出现 `if (i < half)` 这种把线程劈开的发散发——虽然这段代码本身就在，但要让所有 lane 算同一个表达式、再用 mask 把不要的结果忽略掉）；
+- 别让不同线程走不同代码路径（比如按 lane 去 `if (stride==...)`），统一执行 + 掩码累加才是正路。
 
 ```python
 # 概念: 共享内存 reduction（每轮只前半, 遍历所有bank）
@@ -484,7 +494,7 @@ flowchart TB
     D --> E["解法: 统一执行+masked accumulate"]
 ```
 
-**面试要点**：bank 冲突用**相邻 bank 布局或 shfl**；divergence 用**统一执行+掩码**。
+**面试要点**：bank 冲突用**相邻 bank 布局或 shfl** 来破；divergence 则靠**统一执行 + 掩码累加**。
 
 ---
 
@@ -492,15 +502,15 @@ flowchart TB
 
 **回答**
 
-**CUDA Graph 解决的**：**kernel 启动开销（launch overhead）与 CPU 调度延迟**——把一组 kernel 及其依赖**固化成一个图（graph）**，一次 launch 执行整张图，省掉每 kernel 的 CPU→GPU 下发、参数序列化与同步。
+**CUDA Graph 解决的是哪块开销**：**kernel 启动开销（launch overhead）和 CPU 调度延迟**。它的思路是把一组 kernel 及其依赖关系**固化成一张图（graph）**，一次 launch 就执行整张图——省掉了每个 kernel 各自从 CPU 下发到 GPU、参数序列化、同步这些重复动作。
 
-**decode 阶段收益明显**：
-- decode 是**大量小 kernel**（每 token 的 attention/FFN/多个标量 op）——每个小 kernel 的 launch 开销（几μs）**占比高**（kernel 运行时间可能只有几μs）→ 固化成图后省掉成百上千次 launch → 延迟显著降；
-- 固定 shape（seq/num tokens 固定）最适合 graph（预编译 shape 专用）。
+**为什么 decode 阶段收益明显**：
+- decode 是**一大堆小 kernel**（每出一个 token，都要走 attention/FFN 和一堆标量 op）——每个小 kernel 的 launch 开销（几微秒）**占比很高**（它本身运行时间可能也就几微秒）→ 固化成图后，成百上千次 launch 全省了 → 延迟显著降低；
+- decode 的 shape 是固定的（序列长度、token 数都定死），最对 graph 的胃口（它本来就要按固定 shape 预编译）。
 
-**prefill 阶段收益有限**：
-- prefill 是**少量大 kernel**（大矩阵乘），kernel 运行时间长（毫秒级），launch 开销占比小 → 收益被大计算淹没；
-- prefill shape 变化大（不同 prompt 长度），**图缓存命中率低**，反而不利于 graph（需为每个 shape 重建图）。
+**为什么 prefill 阶段收益有限**：
+- prefill 是**少量大 kernel**（大矩阵乘），一个 kernel 动辄跑毫秒级，launch 开销相比之下小得可以忽略 → 收益被大计算淹没了；
+- prefill 的 shape 变化很大（prompt 长短不一），**图缓存命中率低**，反而不利于 graph（每个 shape 都得重建一张图）。
 
 ```python
 launch_us, kernel_us = 5, 100     # prefill: 大kernel
@@ -516,7 +526,7 @@ flowchart LR
     E["prefill: 少量大kernel → launch占比低"] --> F["收益有限 + shape多变缓存差"]
 ```
 
-**面试要点**：graph 省 **launch 开销**；decode 小 kernel 多 → 收益大；prefill 大 kernel 多、shape 变 → 收益小。
+**面试要点**：graph 省的是 **launch 开销**；decode 小 kernel 多 → 收益大；prefill 大 kernel 多、shape 又多变 → 收益小。
 
 ---
 
@@ -524,14 +534,14 @@ flowchart LR
 
 **回答**
 
-**Persistent kernel**：启动**一次** kernel，**在 GPU 上常驻**，用一个循环**处理整个任务队列**（用原子/工作队列分发工作）——而不是每个任务启动一个新 kernel。
+**Persistent kernel 是什么**：只启动**一次** kernel，让它**常驻在 GPU 上**，用一个循环把整个任务队列挨个处理完（靠原子操作/工作队列来分发任务）——而不是每个任务都新起一个 kernel。
 
-**优势场景**：
-1. **解决 launch 开销**：任务多且小（如每 token 一步的 decode、细粒度并行任务）时，一次 launch vs 上百次 launch；
-2. **保持 kernel 状态/数据在 GPU 上**（如维持固定的工作分配、常驻缓冲、warp specialization 的管线）——避免每 kernel 重设状态；
-3. **消除 grid 边界**：许多重 job 分布到同一个 kernel 的并行循环，比反复启动多个 grid 高效。
+**它占优势的场景**：
+1. **省 launch 开销**：任务又多又碎（比如 decode 时每出一个 token 走一步、各种细粒度并行任务）时，一次 launch 顶得上一百次 launch；
+2. **把 kernel 的状态/数据都留在 GPU 上**（比如维持固定的工作分配、常驻缓冲、warp specialization 的流水线）——免去每个 kernel 都要重新设一遍状态；
+3. **消除 grid 边界**：把很多重活摊进同一个 kernel 的并行循环里，比反复启动多个 grid 高效。
 
-**代价/适用**：实现复杂（工作队列、负载均衡、同步）；适合**任务粒度很小、launch 开销占比大**的场景（小 batch decode、图形渲染等）；大 GEMM 不需要（大 kernel 本身就是一次launch）。
+**代价和适用边界**：实现起来比较复杂（要搞工作队列、负载均衡、同步）；它适合**任务粒度很小、launch 开销占比大**的场景（像小 batch decode、图形渲染等）；大 GEMM 用不着它——大 kernel 本身就是一次 launch 了。
 
 ```python
 # 概念: persistent
@@ -552,28 +562,26 @@ flowchart LR
     C --> D
 ```
 
-**面试要点**：一次 kernel 常驻 + 内部队列循环；优势=省启动开销、保持状态，适合小任务流。
-
----
+**面试要点**：一次 kernel 常驻、内部用队列循环干活；优势就是省启动开销、保持状态，特别适合小任务流。
 
 ## Q16. 一个 Triton kernel 的性能只有 cuBLAS 的 60% 时，你会从哪些维度排查：内存访问、计算密度、occupancy、指令选择？
 
 **回答**
 
-**排查维度（由上而下）**：
+性能差这么多，别急着推翻重写，按"由上而下"的顺序一层层查就行：
 
 1. **内存访问**：
-   - 是否 coalesced（Q10）？访问是否连续/对齐？mask 是否全对？→ 用 ncu 看 memory transactions；
-   - 是否有额外的地址计算/重排？（layout 是否妨碍向量化）；
+   - 访问是不是 coalesced（Q10）？地址连续吗、对齐吗？mask 都填对了吗？→ 用 ncu 看 memory transactions；
+   - 有没有多余的地址计算或重排？（layout 是不是妨碍了向量化）；
 2. **计算密度 / 算术强度**：
-   - AI 是否足够？（Q2 第 5 章）若 memory-bound 但实际带宽没满 → 访问模式问题；
-   - tile 复用是否够？BLOCK 太小 → 带宽浪费；
+   - 算术强度 AI 够不够？（第 5 章 Q2）要是本该 memory-bound，但实际带宽也没跑满 → 那多半是访问模式的问题；
+   - tile 复用够不够？BLOCK 太小 → 带宽白浪费；
 3. **occupancy**：
-   - 用 ncu 看 occupancy；BLOCK/num_warps 组合是否让 SM 驻留少？→ 调大/调小；
+   - 用 ncu 看 occupancy；BLOCK/num_warps 的组合是不是让 SM 驻留的块太少？→ 相应调大或调小；
 4. **指令选择**：
-   - 是否生成 MMA（Q12）？还是 fallback 到 FMA？dtype/shape 是否支持；
-   - 是否有不必要的整数/浮点转换、昂贵的 div/mod；
-   - 检查 SASS/PTX（`ptxas -v`）看是否有 FMA 而 MMA 缺失、spill。
+   - 生成了 MMA 还是退回了 FMA（Q12）？dtype/shape 支不支持；
+   - 有没有多余的整数/浮点转换、昂贵的 div/mod；
+   - 查 SASS/PTX（`ptxas -v`），看是不是该有 MMA 却变成了 FMA，或者出现了 spill。
 
 ```python
 def diagnose(mine, ref, profile):
@@ -596,7 +604,7 @@ flowchart TB
     E --> F
 ```
 
-**面试要点**：按**内存→密度→occupancy→指令**四层排查，用 ncu/ptxas 数据定位（coalescing、AI、occupancy、MMA/spill）。
+**面试要点**：就按**内存→密度→occupancy→指令**这四层往下查，拿 ncu/ptxas 的实际数据来定位（重点看 coalescing、AI、occupancy、MMA/spill）。
 
 ---
 
@@ -604,13 +612,13 @@ flowchart TB
 
 **回答**
 
-**为什么融合**：softmax 的数学 = 先 max（防溢出）、再 exp、再 sum、再除。若**分开写**（max kernel、exp、sum kernel、除 kernel），中间结果 `exp(x−m)` 是**与 x 同尺寸的大张量**，每次都要**进出 HBM**：
-- 多写多读 O(T) 数据（好几遍）；
-- 多次 kernel 启动；
-- 中间显存分配/释放；
-- 而融合（Flash 的 running max/sum 或单 kernel 内跨 warp reduce）**让中间量留在片上**。
+**为什么非要融合**：softmax 的数学步骤是——先求 max（防溢出）、再 exp、再 sum、最后相除。要是**分开写**（max 一个 kernel、exp 一个、sum 一个、除一个），那个中间结果 `exp(x−m)` 是**和 x 一样大的大张量**，每一步都得**进出 HBM**：
+- 多写多读 O(T) 的数据（而且是反复好几遍）；
+- kernel 要启动好几次；
+- 中间显存还得来回分配、释放；
+- 一旦融合（用 Flash 的 running max/sum，或者单 kernel 内跨 warp reduce），**中间量就都留在片上了**，根本不用落地。
 
-**分开的 overhead**：额外 2–3 遍全局内存读写 + 4~5 次 kernel launch+同步；对短序列/小 T 可能还可接受，对长序列为大开销。
+**分开写到底多花什么**：额外 2–3 遍全局内存读写，再加上 4~5 次 kernel launch 和同步；短序列、T 小的时候还勉强能忍，序列一长这笔开销就很大了。
 
 ```python
 # 分开: 5个 kernel + 多遍HBM
@@ -629,7 +637,7 @@ flowchart LR
     F["融合: 1 kernel + 片上running max/sum"] --> G["免中间HBM往返"]
 ```
 
-**面试要点**：分离写法=**多遍 HBM 读写 + 多次 launch**；融合让 max/sum/exp 在片上完成。
+**面试要点**：分离写法的毛病是**多遍 HBM 读写加多次 launch**；融合之后，max/sum/exp 全在片上就完成了。
 
 ---
 
@@ -637,11 +645,11 @@ flowchart LR
 
 **回答**
 
-- **bank 数**：现代 NVIDIA GPU 共享内存为 **32 个 bank**（每 bank 4 字节 / 32-bit 字长）。32 个 bank 并行服务一个 warp 的访问（可合并 1 次事务）。
+- **bank 数**：现代 NVIDIA GPU 的共享内存是 **32 个 bank**（每个 bank 4 字节，也就是一个 32-bit 字）。这 32 个 bank 并行服务一个 warp 的访问，合并得好时一次事务就能搞定。
 
-**32-way bank conflict**：一个 warp 的 32 个线程**访问 32 个不同的地址但都落在同一个 bank**——例如：
-- 32 个线程访问 `addr = base + lane*32`（每线程差 32 个 bank … 44 差 = 32×4B 的整数倍）→ 全部命中同一 bank；
-- 或者访问 `s[lane*32]`（FP32 数组，每线程跳 32 个元素）→ 地址都 %32 相同 → 32-way 冲突，硬件把一次访问退化成 **32 次串行**（慢 32 倍）。
+**什么样的访问会产生 32-way bank conflict**：一个 warp 的 32 个线程**访问了 32 个不同的地址，却全落到同一个 bank**。比如：
+- 32 个线程访问 `addr = base + lane*32`（每线程差 32 个 bank——正好是 32×4B 的整数倍）→ 全命中同一个 bank；
+- 或者访问 `s[lane*32]`（FP32 数组，每线程跳过 32 个元素）→ 地址对 32 取余都相同 → 就是 32-way 冲突，硬件被迫把一次访问拆成 **32 次串行**（慢 32 倍）。
 
 ```python
 def bank(addr): return (addr // 4) % 32   # 每 4B 一个bank
@@ -663,7 +671,7 @@ flowchart LR
     D --> E["不同bank → 1事务"]
 ```
 
-**面试要点**：32 bank；`s[lane*stride*...]` 与 bank 数对齐时产生 32-way 冲突。
+**面试要点**：一共 32 个 bank；当 `s[lane*stride*...]` 的步长正好和 bank 数对上时，就会撞出 32-way 冲突。
 
 ---
 
@@ -671,14 +679,14 @@ flowchart LR
 
 **回答**
 
-**实现（Triton 分块+重算）**：
-- Triton 是 **tile 级**编程——用循环按 **BLOCK 循环 K/V**，每轮加载一个 KV tile 到寄存器（TL 层自动 staging到 shared），做分块 QKᵀ、running softmax、accumulate 到输出；
-- 反向时的"重计算"（activation recomputation）：Triton 里**重新前向**层即可（训练时用 `tl` 前向重算而非存全部中间），**编译器自动把每轮循环需要的 tile 重新 load**——重算的显式化由 autotune/`num_stages` 控制；
-- Triton 编程模型天然支持：**循环 + 每块局部 running 状态 + 自动数据 staging**，写 Flash 风格 forward 很自然（官方有 flash 教程）。
+**在 Triton 里怎么做分块加重算**：
+- Triton 是**以 tile 为单位**编程的——用一个循环按 **BLOCK 去扫 K/V**，每轮把一块 KV tile 加载进寄存器（TL 层会自动帮你 staging 到共享内存），然后做分块 QKᵀ、running softmax、再把结果累加到输出；
+- 反向时的"重计算"（activation recomputation）：在 Triton 里**重新跑一遍前向就行**（训练时用 `tl` 前向重算，而不是把所有中间结果存起来），**编译器会自动把每轮循环需要的 tile 重新 load**——重算怎么显式化，由 autotune 和 `num_stages` 来管；
+- Triton 的编程模型天然就支持这套：**循环 + 每块自己的 running 状态 + 自动数据 staging**，写 Flash 风格的前向很自然（官方就有 flash 教程）。
 
-**友好吗**：
-- **是的（前向很友好）**：tile 循环 + running max/sum + dot 都直接表达；
-- **反向（backward/重算）**：需要手写"反向 pass"（Triton 不自动求导自定义 kernel）——重算=再跑 forward 的代码路径，需要显式写 recompute 逻辑；且跨 tile 的 running 状态在反向的重算中也要重算，稍微复杂但可控。
+**对这个模式友好吗**：
+- **前向非常友好**：tile 循环 + running max/sum + dot，都能直接表达；
+- **反向（backward/重算）要认真处理**：得手写"反向那个 pass"（Triton 不会给自定义 kernel 自动求导）——所谓重算，就是再跑一遍 forward 的代码路径，需要显式写 recompute 逻辑；而且跨 tile 的 running 状态在反向重算里也得一并重算，稍微麻烦一点，但还在可控范围。
 
 ```python
 @triton.jit
@@ -706,7 +714,7 @@ flowchart LR
     E --> F["反向重算: 显式重跑forward路径"]
 ```
 
-**面试要点**：Triton tile 循环 + running 状态写 Flash 前向很自然；反向重算需显式重跑前向路径（编译器自动 staging）。
+**面试要点**：用 Triton 的 tile 循环 + running 状态写 Flash 前向非常顺手；反向重算得显式再跑一遍前向路径（staging 让编译器自动做）。
 
 ---
 
@@ -714,15 +722,15 @@ flowchart LR
 
 **回答**
 
-**Warp specialization**：让**不同 warp 承担不同角色**（如 producer warp 专做加载/TMA、consumer warp 专做计算），用 **异步 + 软件流水**在 warp 间传递数据——把"每个 warp 都做 load+compute"拆成管线上的分工，**load 与 compute 真并行**（而不是一个 warp 内部流水）。
+**Warp specialization（warp 分工）是什么**：让**不同的 warp 各司其职**（比如专门的 producer warp 只管加载/TMA、consumer warp 只管计算），再靠**异步加软件流水**在 warp 之间传数据——把原来"每个 warp 自己又 load 又 compute"的写法，拆成流水线上的分工，于是 **load 和 compute 真并行**了（不再是单个 warp 内部的流水）。
 
-**Hopper 的 TMA + warp specialization**：
-- **TMA**（Q7）硬件异步搬运多维 tile 到共享内存，且**不占用 SM 计算 warp**；
-- 结合 **producer/consumer warp**：
-  - producer warp 发 `cp.async.bulk.tensor`（TMA）搬 tile；
-  - consumer warp 做 MMA/计算；
-  - 中间用 **mbarrier（异步屏障）** 在共享内存绑定的数据 ready 时唤醒 consumer；
-- **范式改变**：从"每个 warp 串行 load→compute"→ **"专属 producer/consumer 硬件流水"**，SM 内角色分工 + 数据流动完全异步——kernel 设计从"单 kernel 功 kes"变为"**生产者-消费者软件流水**"（FlashAttention-3 等就是用这套实现更高带宽）。
+**Hopper 上 TMA + warp specialization 是怎么落地的**：
+- **TMA**（Q7）负责把多维 tile 块异步搬到共享内存，而且**不占用 SM 的计算 warp**；
+- 再跟 **producer/consumer warp** 组合起来：
+  - producer warp 发 `cp.async.bulk.tensor`（就是 TMA）把 tile 搬进来；
+  - consumer warp 专心做 MMA/计算；
+  - 它们之间的交接靠 **mbarrier（异步屏障）**：共享内存里那块数据 ready 了，就唤醒 consumer；
+- **范式的变化**：从"每个 warp 串行 load→compute"，变成"**专属的 producer/consumer 硬件流水**"——SM 内部角色分工、数据流动完全异步。kernel 的设计思路也跟着从"单个 kernel 干活"转向"**生产者-消费者式的软件流水**"（FlashAttention-3 这类就是用这套路子榨出更高带宽）。
 
 ```python
 # 概念伪码
@@ -741,7 +749,7 @@ flowchart LR
     E --> F["FlashAttention-3 等: 用TMA+WS达更高带宽"]
 ```
 
-**面试要点**：warp specialization=**producer/consumer 分工**；TMA+异步屏障让搬运与计算真并行，Flash-3 利用它拓展带宽。
+**面试要点**：warp specialization 的本质是 **producer/consumer 分工**；TMA 加异步屏障让搬运和计算真正并行，Flash-3 就是靠这套把带宽用得更满。
 
 ---
 
@@ -749,17 +757,17 @@ flowchart LR
 
 **回答**
 
-**LayerNorm kernel 优化点**：
-1. **跨元素 reduction**：需要行级 `mean/var`——**两遍 reduction**（第一遍 mean，第二遍 var/sqrt）或 **Welford 单遍**；用 warp reduction（shfl）+跨 warp 到 shared；
-2. **避免重复读**：mean 后要 read x 一次广播减法 → 尽量缓存/复用（若数据 fit 寄存器/共享）；
-3. **coalesced 访问**：行主序时按列分配线程使连续地址可合并；
-4. **与后续算子融合**：`norm → act → linear` 的 chain 尽量 fusion（Q16/20 第 5 章）；
-5. **矢量宽度**：每线程用 float4 等向量读，提高带宽效率；
-6. **数值稳定**：`exp? no——layer_norm 是 (x−μ)/σ`，注意 FMA 顺序。
+**自己写 LayerNorm kernel 要顾的点**：
+1. **跨元素的 reduction**：需要行级的 `mean/var`——要么**两遍 reduction**（先求 mean，再求 var/sqrt），要么用 **Welford 单遍**；具体靠 warp reduction（shfl）再跨 warp 汇总到共享内存；
+2. **别重复读**：算完 mean 后还要再读一次 x 做广播减法 → 尽量把 x 缓存、复用起来（数据放得进寄存器/共享内存就放）；
+3. **coalesced 访问**：行主序时按列给线程分任务，让连续地址能合并访问；
+4. **跟后面的算子融合**：`norm → act → linear` 这条链尽量 fusion 掉（第 5 章 Q16/20）；
+5. **向量宽度**：每线程用 float4 之类的向量读，把带宽效率提上去；
+6. **数值稳定**：注意 `(x−μ)/σ` 里 FMA 的顺序（这里没有 exp，别搞混）。
 
-**与 PyTorch 内置的差距**：
-- PyTorch 的 LayerNorm C++/CUDA 实现**已深度优化**（Welford/两遍内存友好、fused kernel、针对 head 大小自动选 kernel、与 autocast 混合精度）；
-- 手写 naive（每线程一行的 double loop）常只有其 **50–80%** 性能；差距在**内存复用、向量化、reduction 技巧、按 shape 分派**。
+**和 PyTorch 内置实现差在哪**：
+- PyTorch 的 LayerNorm（C++/CUDA 实现）**早就深度优化过了**（Welford/两遍内存友好、融合 kernel、按 head 大小自动挑 kernel、还配合 autocast 做混合精度）；
+- 手写 naive 版（每线程处理一行、写个双重循环那种）通常只能到它的 **50–80%**；差的正是**内存复用、向量化、reduction 技巧、按 shape 分派**这几手。
 
 ```python
 # 概念: 手写 naive 两遍
@@ -779,7 +787,7 @@ flowchart TB
     B --> F["PyTorch 内置已全优化 → naive 只有50-80%"]
 ```
 
-**面试要点**：优化点在 **reduction（Welford/两遍）、向量化、coalesce、融合**；差距=内置实现已做全套（多 shape 分派、融合）。
+**面试要点**：优化点集中在 **reduction（Welford/两遍）、向量化、coalesce、融合**；差距在于内置实现已经是全套优化的了（多 shape 分派、融合）。
 
 ---
 
@@ -787,15 +795,15 @@ flowchart TB
 
 **回答**
 
-**必须调用**：**在 block 内线程对 shared memory 生产-消费的依赖点**——比如把数据写进 `__shared__` 后、**在别的线程读它之前**（读自己写的不用）；此外在每次循环迭代使用共享内存前（重新写共享 buffer 时）、reduction 后使用结果 等。
+**必须在哪儿调用**：**在 block 内线程对共享内存"一写一读"的依赖点上**——比如把数据写进 `__shared__` 之后、**在别的线程来读之前**（如果只读自己写的，那不用）；此外，每次循环迭代重新写共享 buffer 之前，以及 reduction 之后要用结果的时候，也都得同步。
 
-**漏调后果**：
-- **数据竞争**：一个线程还在写 `s[i]` 时另一线程已读 `s[i]` → **读旧值/未定义值** → 结果错误（且不崩溃、调试困难）；
-- 跨 block 不需 __syncthreads（block 间独立，只有全局内存+原子/协作组才同步）。
+**漏调会怎样**：
+- **数据竞争**：一个线程还在写 `s[i]`，另一个线程已经去读 `s[i]` 了 → **读到旧值或未定义值** → 结果就错了（而且它不会崩，调试起来很费劲）；
+- 注意跨 block 是不需要 `__syncthreads` 的（block 之间彼此独立，要靠全局内存加原子/协作组才能同步）。
 
-**多调后果**：
-- **性能损失**：每次 __syncthreads 都是一个 barrier（warp 等齐），多余同步拖慢；
-- **死锁风险**：若 barrier 位于 **divergent 分支内**（仅部分线程执行）——block 内部分线程等在 barrier 上、部分走过 → **死锁**（CUDA 编译会警告，但仍可能 hang）。
+**多调会怎样**：
+- **性能折损**：每次 `__syncthreads` 都是一个 barrier（要让整个 warp 等齐），多余的同步自然拖慢速度；
+- **死锁风险**：要是 barrier 落在 **divergent 分支里**（只有部分线程会执行到）——一部分线程等在 barrier 上，另一部分已经跨过去了 → **死锁**（CUDA 编译会警告，但仍可能卡死）。
 
 ```cuda
 __global__ void k(float* in, float* out) {
@@ -815,7 +823,7 @@ flowchart LR
     E["多调"] --> F["性能浪费 + if内同步→死锁"]
 ```
 
-**面试要点**：在"别人要读我写的数据"前调用；漏=数据竞争，多=性能+分支内死锁。
+**面试要点**：就守一条原则——"别人要读我写的数据"之前必须同步；漏了会数据竞争，多了会丢性能、在分支里同步还会死锁。
 
 ---
 
@@ -823,19 +831,19 @@ flowchart LR
 
 **回答**
 
-**工作方式**：`@triton.autotune(configs=[...], key=[...])` 装饰器——在**首次运行（per key）**时，用**启发的基准**跑每个 config 的 kernel 若干次，选**最快的 config** 缓存起来；之后同 key 直接复用缓存。
+**它怎么工作**：靠 `@triton.autotune(configs=[...], key=[...])` 装饰器——在**第一次运行（按 key 区分）**时，用一套启发式的基准，把每个 config 的 kernel 各跑若干次，挑出**最快的那个**缓存起来；之后再遇到同一个 key，直接用缓存，不再重测。
 
-**搜索的配置**：
+**它搜哪些配置**：
 - `BLOCK_*`（块大小）；
-- `num_warps`（每块 warp 数，影响并行度/寄存器压力）；
-- `num_stages`（流水线阶段，影响双缓冲深度与共享内存用量）；
-- 有时也含 `maxnreg`、`group_m/BLOCK_M` 等参数。
+- `num_warps`（每块的 warp 数，影响并行度和寄存器压力）；
+- `num_stages`（流水线阶段，影响双缓冲深度和共享内存用量）；
+- 有时还会带上 `maxnreg`、`group_m/BLOCK_M` 之类的参数。
 
-**控制时间成本**：
-1. **限制 configs 数量**：给 4–8 个精心挑选的候选，不要全枚举；
-2. **key 设计**：只对**影响性能的关键 shape**（如 M/N/K 的倍数）触发 autotune——不同 key 复用缓存；
-3. **预热/提前 benchmark**：在训练/服务启动时跑一次并缓存到文件（`Triton` 支持保存 `.tune` 缓存），避免每次运行重新 tune；
-4. **离线 tune + 固化 config**；对在线场景禁 autotune（`compile` 时传固定 config）。
+**怎么把时间成本压住**：
+1. **限制 config 数量**：给 4–8 个精挑细选的候选就好，别全枚举；
+2. **设计好 key**：只让那些**真正影响性能的关键 shape**（比如 M/N/K 的倍数）去触发 autotune——不同的 key 复用缓存；
+3. **预热/提前 benchmark**：在训练或服务启动时先跑一遍，把结果缓存到文件（Triton 支持存 `.tune` 缓存），别每次运行都重 tune；
+4. **离线 tune + 固化 config**：对在线场景直接关掉 autotune（`compile` 时传固定的 config）。
 
 ```python
 import triton
@@ -859,7 +867,7 @@ flowchart LR
     D --> E["控制成本: 少量config + 按key + 离线固化"]
 ```
 
-**面试要点**：autotune=按 key 首跑选优并缓存；搜索 BLOCK/num_warps/num_stages；控成本=限 config、按 key、离线固化缓存。
+**面试要点**：autotune 是按 key 首跑一遍选出最优并缓存；搜的是 BLOCK/num_warps/num_stages；控成本就三招——限 config 数量、按 key 分、离线固化缓存。
 
 ---
 
@@ -867,14 +875,14 @@ flowchart LR
 
 **回答**
 
-**为什么 atomicAdd 是瓶颈**：反向时多个线程/块可能对**同一地址累加梯度**（如 embedding 梯度中同一个 token 多次出现、卷积/池化反向、Softmax 的 dO 聚合），`atomicAdd` 会把**并发的同地址写串行化**（锁/缓存行争用）——高并发时成为性能瓶颈。
+**为什么 atomicAdd 会成瓶颈**：反向传播时，多个线程/块很可能对**同一个地址累加梯度**（比如 embedding 梯度里同一个 token 出现多次、卷积/池化反向、softmax 的 dO 聚合都是这样），`atomicAdd` 会把**并发的同地址写逼成一个一个排队**（锁争用、缓存行争用）——高并发下自然就成了瓶颈。
 
 **替代方案**：
-1. **Per-thread/per-block 局部缓冲 + 最后归约**：每线程/块维护局部累加，**最后统一 reduce**（避免在热路径上争夺共享地址）；
-2. **数据重排避免冲突**：embedding 反向**按 token 排序/分组**，把同一 token 的梯度批处理成一组（GEMM 化，走后端矩阵算子而非 atomic）；
-3. **separate accumulation + final merge**：对稀疏梯度先存 COO 再稠密（Q24 第 2 章的稀疏梯度思路）；
-4. **使用更细粒度原子**（如 vectorized atomicAdd、按每元素分布）或 **warp 级归约后再 atomic**（把 32 个 atomic 合并成一个）；
-5. **依赖专用 kernel**：如 PyTorch 的 embedding backward 已实现 "sorted + one-hot GEMM"。
+1. **每线程/每块先攒局部缓冲，最后再统一归约**：各自维护局部累加，**最后统一 reduce**，避开在热路径上抢同一个地址；
+2. **重排数据避免冲突**：embedding 反向可以**按 token 排序/分组**，把同一个 token 的梯度凑成一批（变成 GEMM，交给后端矩阵算子去算，而不是硬 atomic）；
+3. **分开累加再合并（separate accumulation + final merge）**：稀疏梯度先存成 COO 再转稠密（就是第 2 章 Q24 那套稀疏梯度思路）；
+4. **用更细粒度的原子**（比如 vectorized atomicAdd、按元素分布）或 **warp 级先归约再 atomic**（把 32 个 atomic 合成一个）；
+5. **交给专门的 kernel**：像 PyTorch 的 embedding backward 就已经实现成 "sorted + one-hot GEMM" 了。
 
 ```python
 # 思想: 先局部累加再合并（避免热点 atomic）
@@ -894,7 +902,7 @@ flowchart LR
     D --> E["消除热点 → 反向快"]
 ```
 
-**面试要点**：atomicAdd 慢在**同地址串行争用**；替代=**局部累加归约、排序分组 GEMM、warp reduce 后单次 atomic**。
+**面试要点**：atomicAdd 慢就慢在**同地址的串行争用**；破解的办法是**局部累加后归约、按 token 排序分组走 GEMM、warp 内先 reduce 再单次 atomic**。
 
 ---
 
@@ -902,15 +910,15 @@ flowchart LR
 
 **回答**
 
-**目标**：`y = swish(xW1) ⊙ (xW2) · W3`——把 xW1、xW2、逐元素乘、Swish、输出投影融合（Q5 第 3 章）。
+**目标**：实现 `y = swish(xW1) ⊙ (xW2) · W3`——把 xW1、xW2、逐元素乘、Swish、输出投影这一串**融合**进一个 kernel（见第 3 章 Q5）。
 
-**设计**：
+**怎么设计**：
 - **block 维度**：
-  - 输出按 **BLOCK_M（token）× BLOCK_N（输出 dim）** 分块；在每块内循环 K（输入 dim）– 两层 GEMM 可用 `tl.dot`；
-  - 中间 `dim_ff` 用**每块完整**（W1/W2 的行/dim_ff 维度）或按 BLOCK_K 分块做两次 dot 后逐元素融合；
-  - 典型：`grid = (M / BLOCK_M, dim / BLOCK_N)`，内层 `tl.dot(w1, x)` 与 `tl.dot(w2, x)` 各算一次 (BLOCK_M, dim_ff)，然后 `swish(a)*b` → 再 `tl.dot(·, w3)`。
-- **数据布局**：权重 W1/W2 按 `(in, dim_ff)` 行主序（因为 dot 的 B 是 [K, N]）；输出按 `(M, out)`；每块内连续 tile → coalesced；
-- 小心共享内存预算：dim_ff 中间量若大，分块在 K 上，用双重缓冲让 `num_stages` 管流水。
+  - 输出按 **BLOCK_M（token）× BLOCK_N（输出 dim）** 分块；在每块内部沿着 K（输入 dim）循环——两层 GEMM 都能用 `tl.dot`；
+  - 中间的 `dim_ff` 要么在每块里**完整展开**（拿 W1/W2 的行/dim_ff 那一维），要么按 BLOCK_K 分块、做两次 dot 后再逐元素融合；
+  - 典型写法：`grid = (M / BLOCK_M, dim / BLOCK_N)`，内层先 `tl.dot(w1, x)` 和 `tl.dot(w2, x)` 各算一次 (BLOCK_M, dim_ff)，接着 `swish(a)*b` → 再 `tl.dot(·, w3)`。
+- **数据布局**：权重 W1/W2 按 `(in, dim_ff)` 行主序摆（因为 dot 里的 B 是 [K, N]）；输出按 `(M, out)`；这样每块内连续 tile → coalesced；
+- 盯紧共享内存预算：dim_ff 的中间量要是太大，就在 K 上分块，并用双重缓冲让 `num_stages` 去管流水。
 
 ```python
 @triton.jit
@@ -944,7 +952,7 @@ flowchart LR
     D --> F["中间量留片上不落HBM → 融合省带宽"]
 ```
 
-**面试要点**：block 按 (M×K 与 F) 分块、两次 dot + 逐元素融合 + 输出 dot——中间量留片上即为融合收益。
+**面试要点**：block 按 (M×K 与 F) 分块，做两次 dot 再逐元素融合，最后再接一个输出 dot——中间量留在片上，就是融合省带宽的意义所在。
 
 ---
 
@@ -952,14 +960,14 @@ flowchart LR
 
 **回答**
 
-**2:4 sparsity（结构化稀疏）**：每 4 个连续元素中**恰好 2 个非零**（2 in 4）。NVIDIA Ampere/Hopper Tensor Core 原生支持这种**结构化稀疏矩阵的魔方加速**：跳过零块，**峰值 FLOPs 翻倍**（如 H100 989T→1979T 稀疏）。
+**2:4 sparsity（结构化稀疏）是什么**：每 4 个连续元素里**恰好 2 个非零**（2 in 4）。NVIDIA Ampere/Hopper 的 Tensor Core 原生支持这种**结构化稀疏矩阵的加速**：直接跳过零块，**峰值 FLOPs 直接翻倍**（比如 H100 从 989T 拉到 1979T）。
 
-**加速哪些层**：
-- **权重稀疏**：把预训练模型按 2:4 结构化剪枝（每 4 取最重要 2 个）→ 权重变稀疏 → 矩阵乘用稀疏 MMA（精度损失小的 2:4 剪枝，常见至多 1-2% 损失）；
-- 应用在 **GEMM 密集的层**：Linear/FFN、attention 的 QKV 与 O 投影（大矩阵乘占比最高的地方）；
-- 不适合/收益小：小矩阵、逐元素、norm、embedding（稀疏位无益）。
+**它能加速哪些层**：
+- **权重稀疏**：把预训练模型按 2:4 结构剪枝（每 4 个里挑最重要的 2 个）→ 权重变稀疏 → 矩阵乘就能用稀疏 MMA（这种精度损失很小，常见的 2:4 剪枝至多也就掉 1-2%）；
+- 用在 **GEMM 密集的层**：Linear/FFN、attention 的 QKV 和 O 投影（大矩阵乘占比最高的就是这些地方）；
+- 不适用、收益也小的地方：小矩阵、逐元素、norm、embedding（稀疏位在这里没好处）。
 
-**注意**：2:4 需要**权重先剪成 2:4 结构**（训练后/量化时），模型精度有轻微损失；激活一般不做 2:4（大多是稠密，难点在激活稀疏）。
+**注意**：2:4 要求**先把权重剪成 2:4 的结构**（训练后剪或在量化时做），模型精度会掉一点；激活通常不做 2:4（大多是稠密的，难点在激活本身难稀疏）。
 
 ```python
 # 2:4 稀疏化（保留每4中最大的2）
@@ -980,7 +988,7 @@ flowchart LR
     D --> E["规避: 小矩阵/elementwise/norm 无益"]
 ```
 
-**面试要点**：2:4 = 每 4 留 2 的结构稀疏，Tensor Core 双倍吞吐；适合大 GEMM 层，精度代价小。
+**面试要点**：2:4 就是每 4 留 2 的结构稀疏，Tensor Core 借它把吞吐翻倍；适合大 GEMM 的层，精度代价很小。
 
 ---
 
@@ -988,16 +996,15 @@ flowchart LR
 
 **回答**
 
-- **NVLink**：多 GPU 机内**高带宽低延迟**（如 H100 900GB/s 点对点）；**PCIe**：主机-设备与跨代共享，带宽低一个量级（~32–64 GB/s）且延迟高；
-- **影响**：
-  - **TP/PP 的层间通信**：TP 每层都通信（Q13 第 7 章）——必须走 NVLink 域（否则每层通信被 PCIe 拖死）；TP 不跨节点是常规（第 7 章 Q9）；
-  - **DP 的梯度 all-reduce**：可以走 PCIe/NVLink 混合，但把梯度搬到主机（offload）用 PCIe 会成瓶颈（ZeRO-Offload 的 PCIe 墙，第 7 章 Q23）;
-  - **数据搬运**：主机加载/保存 checkpoint 走 PCIe，需异步避免占计算。
-
-**何时 overlap 通信与计算**：
-- **通信可预测且量大**（梯度 all-reduce、TP 层间通信、MoE 的 dispatch）——**在反向/前向的空隙里做**（Q28 第 7 章：bucket 粒度、异步梯度同步）；
-- 使用 **streams / 异步 copy（cp.async）** 在计算结点之间插通信；
-- 若通信与计算在**同一资源**（如占用 SM）则不可 overlap（需区别 stream/引擎）。
+- **两者的差距**：**NVLink** 是机内多 GPU 之间**高带宽、低延迟**的互联（像 H100 点对点能到 900GB/s）；**PCIe** 主要管主机与设备、以及跨代共享，带宽低一个量级（约 32–64 GB/s），延迟还更高；
+- **带来的影响**：
+  - **TP/PP 的层间通信**：TP 每一层都要通信（第 7 章 Q13）——所以必须走 NVLink 域，否则每层的通信都会被 PCIe 拖垮；TP 不跨节点也是常规做法（第 7 章 Q9）；
+  - **DP 的梯度 all-reduce**：可以 PCIe/NVLink 混着走，但把梯度搬到主机（offload）走 PCIe 就会成瓶颈（ZeRO-Offload 的那堵 PCIe 墙，第 7 章 Q23）；
+  - **数据搬运**：主机加载/保存 checkpoint 走 PCIe，得用异步方式，别让它占了计算。
+- **什么时候该把通信和计算 overlap**：
+  - **通信可预测、量还大**的时候（梯度 all-reduce、TP 层间通信、MoE 的 dispatch）——就把它**塞进反向/前向的空隙里**（第 7 章 Q28 讲的 bucket 粒度、异步梯度同步）；
+  - 用 **streams / 异步 copy（cp.async）** 在计算节点之间插通信；
+  - 但如果通信和计算**抢同一份资源**（比如都占用 SM），那就 overlap 不了（得区分 stream 和引擎）。
 
 ```python
 nvlink, pcie = 900e9, 60e9
@@ -1013,7 +1020,7 @@ flowchart LR
     F --> G["用 stream/async overlap"]
 ```
 
-**面试要点**：NVLink 高、PCIe 低一个量级——TP 层通信必须 NVLink 域；可预测通信（梯度/TP/调度）用 stream 与计算 overlap。
+**面试要点**：NVLink 带宽高，PCIe 低一个量级——所以 TP 的层间通信必须落在 NVLink 域里；而可预测的通信（梯度/TP/调度）就用 stream 跟计算错峰 overlap。
 
 ---
 
@@ -1021,14 +1028,14 @@ flowchart LR
 
 **回答**
 
-**Launch overhead**：CPU 发起一次 kernel 的成本——包括**驱动调用、参数打包、命令下发、GPU 排队与同步**，通常 **几微秒（1–10 μs）** 量级。
+**launch overhead（启动开销）是什么**：CPU 发起一次 kernel 要付出的成本——包括驱动调用、参数打包、命令下发、GPU 排队与同步，通常就在**几微秒（1–10 μs）**的量级。
 
-**何时超过计算时间**：
-- kernel 的**实际执行时间 < launch 开销**时：对**小问题**（很短的序列、单 token、小矩阵）计算可能只有几 μs 甚至 sub-μs——于是 launch 占大头；
-- 例：decode 阶段的一个小 attention/FFN（T=1）执行 ~10 μs，launch 5-8 μs → 开销约一半；
-- 大量小 kernel 连续（如 eager 模拟成百个 op）→ CPU 成为瓶颈（GPU 空等）。
+**什么情况下它会超过实际计算时间**：
+- 当 kernel 的**实际执行时间小于 launch 开销**时：对**小问题**（很短的序列、单个 token、小矩阵）计算本身可能就几 μs 甚至不到 1 μs——launch 反倒占了大头；
+- 举个例子：decode 阶段的一个小 attention/FFN（T=1）跑 ~10 μs，而 launch 要 5-8 μs → 开销差不多占了一半；
+- 大量小 kernel 连成串（比如用 eager 模式模拟成百上千个 op）→ CPU 本身成了瓶颈（GPU 反而在空等）。
 
-**对策**：**CUDA Graph（Q14）** 一次 launch 一张图的全部 kernel、**kernel 融合**（少启动）、**连续 batching**（多请求核批）。判断是否 launch-bound 用 profiler 看 kernel 时长与 launch 时长之比。
+**对策**：可用 **CUDA Graph（Q14）**把一整张图的 kernel 一次 launch 出去、做 **kernel 融合**（少启动几次）、用**连续 batching**（把多个请求拼进一批）。想知道是不是 launch-bound，用 profiler 看 kernel 时长和 launch 时长的比值就明白了。
 
 ```python
 def launch_dominates(kernel_us, launch_us=6):
@@ -1052,7 +1059,7 @@ flowchart LR
     C --> D["解法: CUDA Graph / 融合 / 批处理"]
 ```
 
-**面试要点**：launch ≈ 微秒级 CPU 成本；**kernel 执行时间接近或低于它（小问题）时主导**——用图/融合/批处理消除。
+**面试要点**：launch 是微秒级的 CPU 成本；一旦 **kernel 执行时间接近或低于它（小问题）**，launch 就成了主导——那就用图、融合、批处理来消掉。
 
 ---
 
@@ -1060,11 +1067,11 @@ flowchart LR
 
 **回答**
 
-**跨 warp reduction 的管线**：
-1. **每线程局部 reduce**（读自己的行/片段，先局部 max/sum）；
-2. **warp 内 reduce（shuffle）**：用 `__shfl_*` 在 32 线程内先合并（每 warp 得到部分 max/sum）——**快、不需共享内存**；
-3. **跨 warp reduce（shared memory）**：把**每个 warp 的部分结果**写进 `__shared__`（只有 num_warps 个值），`__syncthreads()`，再由第一个 warp（或专线程）从共享内存读出合并 8~16 个部分值，算出全局 max/sum；
-4. 把全局统计**广播**回所有线程（shuffle 或共享内存读）完成归一化。
+**跨 warp 做 reduction 的流水线**是这样：
+1. **每线程先做局部 reduce**（读自己那一段/一行，先把局部 max/sum 算出来）；
+2. **warp 内 reduce（用 shuffle）**：用 `__shfl_*` 在 32 个线程里先合并（每个 warp 得到一份局部 max/sum）——**又快、又不需要共享内存**；
+3. **跨 warp reduce（用 shared memory）**：把**每个 warp 的局部结果**写进 `__shared__`（也就 num_warps 个值），`__syncthreads()` 同步后，再由第一个 warp（或专门的一个线程）从共享内存读出这 8~16 个部分值、合并成全局 max/sum；
+4. 最后把全局统计量**广播**回所有线程（用 shuffle 或共享内存读），再完成归一化。
 
 ```cuda
 // 阶段示意
@@ -1088,7 +1095,7 @@ flowchart TB
     D --> E["广播回所有线程 → 归一化"]
 ```
 
-**面试要点**：**shuffle 管 warp 内、shared 管跨 warp**（把 num_warps 个部分值放共享 + syncthreads 后再合并），最后广播。
+**面试要点**：分工很清楚——**shuffle 管 warp 内、shared 管跨 warp**（把 num_warps 个部分值丢进共享内存、`syncthreads` 后再合并），最后再广播回所有线程。
 
 ---
 
@@ -1096,14 +1103,14 @@ flowchart TB
 
 **回答**
 
-**复用 Flash tiling 框架**：FlashAttention 的核心骨架 = **分块读取 Q/K/V tile + running softmax + 累加**。新注意力变体只要**修改"哪些 KV 参与打分"的逻辑**，其余（tiling、running stats、最终归一）都复用：
+**复用 Flash 的 tiling 框架**：FlashAttention 的骨架其实就三件事——**分块读 Q/K/V tile + running softmax + 累加**。你要写新的注意力变体，只要**改"哪些 KV 参与打分"这一层逻辑**，其余（tiling、running 统计量、最终归一）全都可以照搬。
 
-**以 sliding window + global token 为例**修改点：
-1. **KV 块的筛选**：sliding window 下，每个 Q 位置只对**它附近的 KV tile** 计算（`|i−j| ≤ W`）——在**每轮 KV 循环里加范围掩码**（`mask = |i−j|≤W`），把窗口外的分块跳过或设为 −∞；
-2. **global token 处理**：让前 g 个 token（如 [CLS]）可以**访问全部 KV**（special 路径）——可以把它当作另一类 Q 的处理（对 global token 少做窗口限制或在循环外层特殊处理）；
-3. **running max/sum** 依然有效（因为改了 mask 后每个块仍返回归一结果，running 合并逻辑不变）；
-4. **tiling 循环范围**：窗口内 KV 的 tile 数量从 T/block 变为 2W/block → **循环更短**（省算力）；
-5. **block 内跨 warp 处理**：若窗口小，调整每块覆盖的 Q 数量/block，保持 occupancy。
+**拿 sliding window + global token 当例子，要改这几点**：
+1. **筛 KV 块**：sliding window 下，每个 Q 位置只跟**它附近的 KV tile** 算（`|i−j| ≤ W`）——在**每轮 KV 循环里加一个范围掩码**（`mask = |i−j|≤W`），把窗口外的分块跳过或置为 −∞；
+2. **处理 global token**：让前 g 个 token（比如 [CLS]）能**访问全部 KV**（走一条特殊路径）——可以把它们当作另一类 Q 来处理（对 global token 少限制窗口，或者放到循环外层单独处理）；
+3. **running max/sum 照样有效**（因为改了 mask 之后每个块仍然返回归一后的结果，running 的合并逻辑不用动）；
+4. **调整 tiling 循环的范围**：窗口内 KV 的 tile 数从 T/block 缩到 2W/block → **循环更短**（省算力）；
+5. **block 内跨 warp 的处理**：如果窗口比较小，就调整每块覆盖的 Q 数量/block，保住 occupancy。
 
 ```python
 @triton.jit
@@ -1131,7 +1138,7 @@ flowchart LR
     D --> F
 ```
 
-**面试要点**：复用=**tiling+running softmax+累加骨架**；修改=**KV 参与范围（缩短窗口循环 + mask/global path）**，running 逻辑与归一不动。
+**面试要点**：能复用的是**tiling、running softmax、累加这套骨架**；要改的只是 **KV 参与的范围**（缩短窗口循环 + 加 mask/global 的特殊路径），running 逻辑和归一化原封不动。
 
 ---
 
