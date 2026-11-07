@@ -2,19 +2,23 @@
 
 > 面试生普（LLM 500 题）· 第 5 章。本章覆盖 GPU 架构哲学、arithmetic intensity 与 roofline、FlashAttention、PagedAttention、kernel fusion、混合精度、显存带宽与推理速度、投机解码、Continuous Batching 等 30 个问题，关键概念配 Python 代码与 mermaid 图解。
 
+> 先把话说清楚：大模型的训练和推理，最后都要落到 GPU 这块芯片上跑。同样一块卡，懂不懂它的"脾气"，跑出来的速度能差好几倍。这一章就带你认识 GPU 的基本构造（核心、显存、带宽），再讲几个决定速度的关键概念——计算强度、roofline、FlashAttention、量化、投机解码等。你不需要事先懂 CUDA，跟着每题从"为什么会慢"讲到"怎么把它变快"，就能建立起对 GPU 性能的直觉。30 个问题，每题的"回答"讲道理，"面试要点"给你一句能拿出去说的浓缩版。
+
 ---
 
 ## Q1. GPU 的 SM 数量与 CPU 核心数量在架构哲学上有何根本不同？为什么 GPU 用大量线程来"掩盖"延迟？
 
 **回答**
 
-- **CPU 核心**：少（4–64）但**很强**——超大乱序执行、分支预测、缓存命中优化，用"**执行为中心**"的复杂流水线压低延迟。
-- **GPU SM（Streaming Multiprocessor）**：大量（如 A100 108 SM）但**更简单**——每 SM 可驻留上千线程，用**吞吐量**而不是单线程延迟来算总账。
+CPU 和 GPU 在设计思路上，几乎是两个极端。可以先这样理解：**CPU 是"几个博士"，GPU 是"几千个熟练工"**。
 
-**为什么 GPU 用大量线程掩盖延迟**：
+- **CPU 核心**：数量少（一般 4–64 个），但每一个都很强。它靠超大号的乱序执行、分支预测、缓存命中优化，用一整套以"把单个任务尽快算完"为中心的复杂流水线，把延迟压到最低。
+- **GPU 的 SM（Streaming Multiprocessor，流式多处理器）**：数量多（比如 A100 有 108 个 SM），但每个都比 CPU 核心简单。一个 SM 里可以同时驻留上千个线程，它不算"单个线程有多快"，而是算"一大摊活一起干，总共能出多少活"。
 
-- GPU 的**访存延迟**（访问 HBM，~500 周期）远高于计算；CPU 用**缓存+乱序**硬扛，GPU 另一种策略——**超线程并行**：同时驻留几千个线程，当一个 warp 等内存时，**调度器切换到别的 warp** 继续执行（上下文切换极廉价）；只要有足够并发，"等内存"的时间被其他 warp 的计算填满。
-- 公式直觉：**隐藏延迟需要的并发 = 带宽需求 × 延迟**。GPU 的算力/带宽都高，所以需要海量线程把延迟淹没在并发里。
+**那 GPU 为什么要靠大量线程来"掩盖"延迟呢？**
+
+- GPU 访问显存（HBM）的延迟很高，大约 500 个周期，远高于它做一次计算的时间。CPU 的应对办法是用缓存加乱序执行硬扛；GPU 换了个思路——**超线程并行**：同一时刻驻留几千个线程，某个线程（更准确说是 warp）在等内存的时候，调度器立刻切换到别的 warp 接着算，而且这种切换极其廉价。只要并发足够多，"等内存"的空档就会被其他 warp 的计算填满。
+- 用公式体会一下：**要藏住延迟，需要的并发量 = 带宽需求 × 延迟**。GPU 的算力和带宽都很高，所以得靠海量线程把延迟"淹没"在并发里。
 
 ```mermaid
 flowchart LR
@@ -24,7 +28,7 @@ flowchart LR
     D --> F["吞吐量型（LLM 主流）"]
 ```
 
-**面试要点**：哲学差异=**复杂性 vs 并发度**；GPU 靠"海量线程并发切换"把访存延迟藏进其他 warp 的计算里。
+**面试要点**：两者的哲学差异就是"拼单核的复杂程度"还是"拼并发的规模"；GPU 靠"海量线程来回切换"把访存延迟藏进其他 warp 的计算里。
 
 ---
 
@@ -32,13 +36,13 @@ flowchart LR
 
 **回答**
 
-- **计算强度（Arithmetic Intensity, AI）** = **运算量 FLOPs / 访问字节数**（单位：FLOPs/byte）。它刻画"每传 1 字节能做几次运算"。
+先说定义。**计算强度（Arithmetic Intensity，简称 AI）** 就是 **运算量 FLOPs 除以访问的字节数**，单位是 FLOPs/byte。说白了，它衡量"每搬运 1 字节的数据，能顺便做几次运算"。这个比值越大，说明计算越"划算"，越不亏在搬运上。
 
-**Roofline 判断**：
+**Roofline 模型怎么判断**：我们可以把硬件想象成一间有两条限制的工厂。
 
-- 硬件有**峰值算力 P（FLOPs/s）** 与 **峰值带宽 B（bytes/s）**，得到**转折点 `AIᵢ = P/B`**（FLOPs/byte，叫 ridge point）。
-- 对算子：若 `AI > AIᵢ` → **compute-bound**（算力是瓶颈，利用率受限于 P）；若 `AI < AIᵢ` → **memory-bound**（带宽是瓶颈，利用率受限于 B）。
-- 图上看：在 roofline 图上，算子的点落在上升段（带宽受限）还是平台段（算力受限）。
+- 硬件有两个上限：**峰值算力 P（FLOPs/s）** 和 **峰值带宽 B（bytes/s）**。把两者一除，得到一个转折点 `AIᵢ = P/B`（单位 FLOPs/byte），业内叫 ridge point（屋脊点）。
+- 对一个算子来说：如果它的 `AI > AIᵢ`，说明它算得又快又不太依赖搬运，瓶颈落在算力上，是 **compute-bound（算力受限）**；反过来若 `AI < AIᵢ`，说明它大部分时间都在等数据搬运，瓶颈落在带宽上，是 **memory-bound（带宽受限）**。
+- 画到 roofline 图上就更直观：算子的点落在上升的那段（带宽受限），还是落在顶端平台那段（算力受限）。
 
 ```python
 P = 990e12      # H100 BF16 峰值 FLOPs/s
@@ -60,7 +64,7 @@ H100 ridge point ≈ 295 FLOPs/byte
 T=  512: AI≈   2621440 → compute-bound（大 T 时 AI 高）
 ```
 
-（实际上 T 大到一定后 attention 趋于 compute-bound；decoder 短序列则 memory-bound —— 呼应 Q10/Q11。）
+（实际上 T 大到一定程度后 attention 会趋于 compute-bound；而 decoder 处理短序列时则是 memory-bound——这一点呼应 Q10、Q11。）
 
 ```mermaid
 flowchart LR
@@ -71,7 +75,7 @@ flowchart LR
     D --> F["优化: 省带宽, 融合/复用"]
 ```
 
-**面试要点**：`AI=FLOPs/bytes`；Ridge=算力/带宽；AI>ridge 是 compute-bound，反之为 memory-bound。
+**面试要点**：记住公式 `AI=FLOPs/bytes`，ridge 点=算力除以带宽；AI 大于 ridge 是 compute-bound，反之是 memory-bound。
 
 ---
 
@@ -79,15 +83,18 @@ flowchart LR
 
 **回答**
 
-- **核心瓶颈：显存带宽（HBM 带宽）**。标准 attention 每层要**把 `QKᵀ` 的完整矩阵 `B·H·T²` 写出再读回 HBM 多次**（scores→softmax→乘以V），带宽消耗 O(T²)。大 T 时带宽把时间拖死，也是显存容量爆掉的主因。
+要回答这题，先要搞清标准 attention 到底卡在哪。
 
-**FlashAttention 的解法**：
+- **它卡的核心瓶颈是显存带宽（HBM 带宽）**。标准 attention 每一层都要把 `QKᵀ` 的完整矩阵（大小为 `B·H·T²`）写到 HBM 再读回来，而且不止一遍（算完 scores 写一次、做 softmax 重读、再乘以 V 又读），带宽消耗是 O(T²)。T 一大，时间就全耗在来来回回搬数据上，显存容量也是这时候被撑爆的。
 
-1. **tiling（分块）**：把 Q、K、V 切成块，**一次把一整个 output block 所需的 Q/K/V tile 读进 SRAM**，在其内部完成分块 softmax 计算，**不落回 HBM**——把 O(T²) 的中间矩阵访问降到 O(T)·读三次 QKV；
-2. **online softmax（运行式 softmax）**：因为不能一次看到全 T，用**running max + running sum** 的方式增量归一化：每个 tile 先用自己的 max/sum，跨 tile 修正（`rescale`），最终每个位置的 softmax 结果与全局 softmax **数值等价**。
+**FlashAttention 的解法**，核心是两招：
 
-**避免了什么**：
-- 避免**实例化完整 `B·H·T²` scores 矩阵**（回到 SRAM 里,不进 HBM）；从而内存 O(T)（+T 的 running statistics），速度大幅提升（bandwidth 节省）。
+1. **tiling（分块）**：把 Q、K、V 切成一块一块。算一个输出块时，把它需要的 Q/K/V 小块一次性读进 SRAM（芯片上的高速缓存），在里头把分块 softmax 算完，**从不写回 HBM**。于是原本 O(T²) 的中间矩阵访问，降成了 O(T)（QKV 各读一遍的量级）。
+2. **online softmax（运行式 softmax）**：因为没法一次看到全长的 T，就用**running max + running sum** 的方式一边看一边归一化：每个 tile 先用自己的 max 和 sum，跨 tile 时再做修正（rescale），最终每个位置算出来的 softmax 结果，和全局 softmax 在数值上完全等价。
+
+**它避免了什么**：
+
+- 避免了**真的去实例化一整个 `B·H·T²` 的 scores 矩阵**——这个矩阵始终留在 SRAM 里，不进 HBM。所以显存开销降到 O(T)（再加上 T 个 running 统计量），速度因为省了大量带宽而明显变快。
 
 ```python
 def online_softmax_running(x, m_prev, s_prev):
@@ -115,7 +122,7 @@ flowchart TB
     F --> G
 ```
 
-**面试要点**：瓶颈=**HBM 带宽**（不是算力）；tiling 把 T² 中间矩阵留在 SRAM，online softmax 用 running max/sum 数值等价地完成归一化。
+**面试要点**：瓶颈是 **HBM 带宽**（不是算力）；tiling 把 T² 的中间矩阵留在 SRAM 里，online softmax 用 running max/sum 在数值上等价地完成归一化。
 
 ---
 
@@ -123,16 +130,16 @@ flowchart TB
 
 **回答**
 
-**数值稳定性**：标准 softmax 用"`exp(x-max)`"技巧防溢出；online softmax 在**分块**下必须保持同样的技巧——每块**先减掉自己的最大 max，再缩放**，跨块时用 running max 更新并**重缩放**。
+先讲稳定性。标准 softmax 用"先减最大值再取 exp"的技巧来防溢出；online softmax 虽然改成分块算，但这个技巧一点不能丢——每一块都要**先减掉本块自己的最大值再缩放**，跨块时用 running max 更新，并把之前累积的量**重新缩放**。
 
-**算法**：对每个块（tile）的分数 `x_i`：
+**算法**：对每个块（tile）里的分数 `x_i`，一步步来：
 
-1. 记 running `m = max(已见)`、`s = Σ exp(x - m)`（对已见部分）；
-2. 新块：`m' = max(m, max(x_i))`；
-3. 重新缩放旧累加：`s' = s·exp(m - m') + exp(x_i - m').sum()`；
-4. 输出归一：`p = exp(x_i - m') / s'`（对整块并行可做局部+重缩放）。
+1. 记 running `m = max(已见)`、`s = Σ exp(x - m)`（都只针对已经看过的那部分）；
+2. 遇到新块：`m' = max(m, max(x_i))`；
+3. 把旧的累加量按新 max 重新缩放：`s' = s·exp(m - m') + exp(x_i - m').sum()`；
+4. 输出做归一：`p = exp(x_i - m') / s'`（整块可以并行算局部结果再重缩放）。
 
-**数值等价**：最终 `s = Σ_all exp(x_all - max_all)`；因为只在减法里出现过 max，没有大数相减，且指数前的乘数都是 `exp(≤0)`——**与全局 softmax 完全一致**。
+**为什么数值等价**：最终算出的 `s = Σ_all exp(x_all - max_all)`。整个过程中 max 只出现在减法里，不会有大数相减，且每个指数前的乘数都是 `exp(≤0)` 这种不超过 1 的数——所以结果和一次性做全局 softmax **完全一致**。
 
 ```python
 import torch
@@ -168,7 +175,7 @@ flowchart LR
     A --> E["避免大数减法 + 指数前因子始终 exp(≤0) → 稳定"]
 ```
 
-**面试要点**：块内 max、跨块 running max+重缩放；数值稳定靠"全程减 running max"。
+**面试要点**：块内各自求 max，跨块靠 running max 加重缩放；数值稳定的关键在于"全程都在减当前的 running max"。
 
 ---
 
@@ -176,14 +183,15 @@ flowchart LR
 
 **回答**
 
-**为什么计算量没变**：FlashAttention 依旧要算 QKᵀ、softmax、×V —— FLOPs 仍是 O(T²)。它改的是**数据访问（memory hierarchy）**，不是算法复杂度。
+先澄清一个容易误会的地方：**计算量其实没变**。FlashAttention 照样要算 QKᵀ、做 softmax、再乘 V，FLOPs 仍然是 O(T²)。它改的不是算法复杂度，而是**数据访问的方式（也就是在存储层级之间怎么搬数据）**。
 
-**速度提升的来源**：
-1. **HBM 带宽省**：标准 attention 每个位置把中间 `B·H·T²` 分数矩阵**写读多次**（scores 写一次、softmax 重读、×V 再读），瓶颈是**带宽**（Q2/Q3）；Flash 让这些中间矩阵**只在 SRAM 内流转**，与 HBM 的传输降到 O(T)，**而 HBM 带宽比 SRAM 慢几十倍**——省带宽即省时间；
-2. **kernel fusion**：把 QK 乘、softmax、×V 融合成**一个大 kernel**，省掉多次 kernel 启动与中间张量的分配/拷贝；
-3. **更少显存回收**：不需要临时为 scores 分配/释放大块显存，减少 allocator 与 L2 的抖动。
+**那速度提升是从哪来的呢**：
 
-所以虽然 FLOPs 一样，但**有效吞吐受带宽支配**；Flash 把"带宽瓶颈"换成"算力"，实际快 2–6×（GPU 上注意力短序列 3 倍、长序列 5–8× 常见）。
+1. **省了 HBM 带宽**：标准 attention 在每个位置都要把中间那块 `B·H·T²` 的分数矩阵**写出去、读回来好几遍**（scores 写一次、softmax 重读、再乘 V 又读一次），瓶颈就在带宽上（见 Q2、Q3）；Flash 让这些中间矩阵**只在 SRAM 内部流转**，跟 HBM 之间的传输量降到 O(T)，而 HBM 带宽比 SRAM 慢几十倍——省下带宽就等于省下时间。
+2. **kernel fusion（算子融合）**：把 QK 相乘、softmax、乘 V 融合成**一个大 kernel**，省掉了好几次 kernel 启动，也省掉中间张量的分配和拷贝。
+3. **少了显存回收**：不用为 scores 临时申请、释放大块显存，分配器和 L2 缓存的抖动都变少了。
+
+所以虽然 FLOPs 一样，但**实际吞吐其实由带宽支配**；Flash 等于把"带宽瓶颈"换成了"算力瓶颈"，实测通常快 2–6 倍（短序列 attention 常见 3 倍，长序列常见 5–8 倍）。
 
 ```python
 # 量化：标准 VS flash 的 HBM 传输
@@ -197,6 +205,8 @@ print(f"标准: {standard_bytes/1e9:.0f} GB  vs  Flash: ~{flash_bytes/1e9:.1f} G
 标准: 4.3 GB  vs  Flash: ~0.02 GB   → 带宽喝几个数量级的差距
 ```
 
+（上面这段输出里的"喝"是"差"的笔误，意思就是带宽用量差了好几个数量级。）
+
 ```mermaid
 flowchart LR
     A["标准: QKᵀ 矩阵进出 HBM (带宽瓶颈)"] --> B["慢（受带宽支配）"]
@@ -205,7 +215,7 @@ flowchart LR
     D --> E
 ```
 
-**面试要点**：FLOPs 没少，**省的是 HBM 带宽+kernel 启动**；瓶颈从"带宽"换到"算力"，所以实际快很多。
+**面试要点**：FLOPs 并没有减少，省的是 **HBM 带宽和 kernel 启动开销**；瓶颈从"带宽"换成"算力"，所以实际速度提升很多。
 
 ---
 
@@ -213,15 +223,17 @@ flowchart LR
 
 **回答**
 
-**借用 OS 的"虚拟内存分页"思想**：把连续的逻辑 KV Cache 分成**固定大小的块（pages/block）**，逻辑块映射到**物理块（固定大小、预分配的缓冲）**——类似虚拟页→物理页映射。物理块可以**不连续**，用块表（block table）跟踪映射。
+PagedAttention 的灵感，直接来自操作系统的**虚拟内存分页**。
 
-**解决的碎片化问题**：
+**借用的思想**：把一串逻辑上连续的 KV Cache，切成一块一块**固定大小的块（page / block）**，每个逻辑块再映射到一块**物理块**（大小固定、提前分配好的缓冲）上——这和"虚拟页映射到物理页"是一个道理。物理块之间**可以不连续**，靠一张块表（block table）来记录"逻辑上的第几块，实际存在哪块物理内存里"。
 
-1. **内部碎片（internal fragmentation）**：传统连续分配为每个请求预留"最大可能长度" → 大部分预留空置；分页后**按需分配块**，新增块时再分配，避免大块预留浪费；
-2. **外部碎片（external fragmentation）**：不同长度的请求使连续内存被切成难以复用的洞；固定 size 的物理块让释放/复用更灵活；
-3. **预留浪费（reservation waste）**：不再为"最坏情况长度"整段预留。
+**它解决了哪几种碎片化问题**：
 
-（Q31 有这 3 类浪费更细的展开。）
+1. **内部碎片（internal fragmentation）**：传统连续分配要为每个请求预留"最大可能长度"的空间，结果大部分都空着；分页后**按需分配块**，需要了再给新块，避免了整段大预留的浪费。
+2. **外部碎片（external fragmentation）**：不同长度的请求会把连续内存切出很多难以复用的小洞；用固定大小的物理块，释放和复用都灵活得多。
+3. **预留浪费（reservation waste）**：不再为"最坏情况的长度"一整段预留空间。
+
+（这三类浪费更细的展开，可以看第 Q31 题（第 9 章）。）
 
 ```python
 class BlockTable:
@@ -248,7 +260,7 @@ flowchart LR
     E -.->|复用| F
 ```
 
-**面试要点**：借用**虚拟分页**；解决**内部碎片+外部碎片+预留浪费**三类碎片化（连续分配利用率低至 20–40%）。
+**面试要点**：借用了**虚拟内存分页**的思想；解决的是**内部碎片、外部碎片、预留浪费**这三类碎片化（传统连续分配的显存利用率能低到 20–40%）。
 
 ---
 
@@ -256,19 +268,24 @@ flowchart LR
 
 **回答**
 
-**收益最高的条件**：
-1. **memory-bound 的元素链**：两个/多个 elementwise（norm→relu→dropout）之间不需要中间张量落 HBM → 融合省掉反复读写；
-2. **kernel 启动开销占大头**：许多小 kernel 时融合显著减少启动；
-3. **中间张量很大且只被消费一次**：融合避免大中间 buffer 的分配与往返。
+融合不是越多越好，得看场景。
 
-**融合反而有害（寄存器压力 → occupancy 下降）的条件**：
-- 融合后**单 kernel 需要太多寄存器/共享内存**（保存多个中间值），寄存器不足 → **每个 SM 能驻留的线程块（occupancy）下降** → 并发度降低掩盖延迟的能力变差 → 反而更慢；
-- 需要保存跨 tile 的大状态（如融合 attention 的二次项）时尤其受限于寄存器；
-- 融合使某个完全可并行的小 op 变成 serial 依赖链（如把两个输入都依赖同一笔数据），也得不偿失。
+**收益最高的情况**：
+
+1. **memory-bound 的逐元素运算链**：两个或多个 elementwise 运算（norm→relu→dropout）串在一起，中间结果不需要写进 HBM——融合一下就把反复读写全省了；
+2. **kernel 启动开销占大头**：有很多小 kernel 时，融合能显著减少启动次数；
+3. **中间张量很大且只被用一次**：融合能避免为这块大中间缓冲做分配和来回搬运。
+
+**融合反而有害的情况（寄存器压力导致 occupancy 下降）**：
+
+- 融合之后，**单个 kernel 需要太多寄存器或共享内存**来保存多个中间值。寄存器不够用，编译器就会把变量溢出（spill），**每个 SM 能同时驻留的线程块数（occupancy）随之下降**，并发度掉下来，掩盖延迟的能力就变差，结果反而更慢；
+- 尤其要保存跨 tile 的大状态时（比如融合 attention 里的二次项），寄存器会被顶满；
+- 另外，融合可能把一个原本完全并行的小运算，变成一条串行的依赖链（比如两个输入都依赖同一份数据），那也得不偿失。
 
 **判断标准**：
-- 先算 memory-bound（Q2）；
-- 融合后是否**在寄存器/共享内存预算内**；观察 occupancy（通过 kernel 统计器/`--ptxas-options=-v` 查寄存器数）。
+
+- 先算清楚它是不是 memory-bound（见 Q2）；
+- 再看融合后是否**落在寄存器、共享内存的预算内**；可以用 kernel 统计工具或 `--ptxas-options=-v` 查寄存器用量，观察 occupancy。
 
 ```python
 # 概念: 融合 vs 不融合的带宽
@@ -288,7 +305,7 @@ flowchart TB
     D --> E
 ```
 
-**面试要点**：memory-bound 的 elementwise 链最赚；**融合挤寄存器→occupancy↓→反而慢**——需在"省带宽"与"保持并发"间平衡。
+**面试要点**：memory-bound 的逐元素运算链最划算；但**融合把寄存器挤爆会导致 occupancy 下降，反而变慢**——要在"省带宽"和"保住并发"之间找平衡。
 
 ---
 
@@ -296,20 +313,24 @@ flowchart TB
 
 **回答**
 
+先看三种数值格式的对比（大致概念即可，具体数字按硬件略有出入）：
+
 | 格式 | 指数位 | 尾数位 | 精度 | 吞吐（相对 FP16 典型比例） | 典型用途 |
 |---|---|---|---|---|---|
 | TF32 | 8 | 10（丢一半尾数） | 中 | 与 FP16 相近（许多卡 ~8-16 TFLOPs 处理倍数） | **卷积/GEMM 的加速占用** |
 | FP16 | 5 | 10 | 高（但范围窄） | 高 | 大 GEMM |
 | BF16 | 8 | 7 | 低（2-3 位有效数字） | 高（与 FP16 同级） | 大 GEMM |
 
-**取舍**：
-- **TF32**：跟 FP32 相同指数（动态范围大）但尾数砍半——**稳定、不用 loss scaling**，吞吐比 FP32 快很多，但比 FP16/BF16 的高精度小 GEMM慢；适用于**数值不敏感、范围宽**的 GEMM（例如 attention 里 QKᵀ、卷积），也用于简单精度需求；
-- **FP16/BF16**：尾数多（或范围大）更适合**需要更高预精度的训练主路径**（如 FFN 的大 GEMM、attention 的 logits）。
+**怎么取舍**：
 
-**训练中选哪个**：
-- **attention 的 QKᵀ/AV（打分/聚合）**：对精度敏感度中等——常用 FP16/BF16（BF16 更稳，FP16 需 loss scaling）；TF32 也可做 "stable fallback"；
-- **线性层/FFN 大 GEMM**：用 **BF16/FP16**（吞吐最高）；
-- **loss/中间统计/norm**：保持 FP32（Q10 第 2 章）。
+- **TF32**：指数位和 FP32 一样（动态范围大），但尾数砍掉一半。好处是**数值稳定、不需要 loss scaling**，吞吐又比 FP32 快很多；坏处是比 FP16/BF16 那种"高精度小 GEMM"要慢一些。适合**数值不敏感、范围又宽**的 GEMM（比如 attention 里的 QKᵀ、卷积），也用于精度需求简单的场合；
+- **FP16/BF16**：尾数更多（或者范围更大），更适合**需要较高精度的主训练路径**（比如 FFN 的大 GEMM、attention 的 logits）。
+
+**训练里具体怎么选**：
+
+- **attention 的 QKᵀ / AV（打分与聚合）**：对精度敏感度中等——常用 FP16/BF16（BF16 更稳，FP16 需要 loss scaling）；TF32 也可以做"稳定兜底"；
+- **线性层 / FFN 的大 GEMM**：用 **BF16/FP16**（吞吐最高）；
+- **loss、中间统计量、norm**：保持 FP32（这一点第 2 章 Q10 会细讲）。
 
 ```python
 def matmul_precisions(d, T, mode):
@@ -331,7 +352,7 @@ flowchart LR
     D --> G
 ```
 
-**面试要点**：TF32 尾数少但范围大（稳定不需要 loss scaling）；BF16 尾数更少但范围同 FP32；主 GEMM 用 BF16/FP16，统计用 FP32，TF32 用于稳定折中。
+**面试要点**：TF32 尾数少但范围大（稳定，不需要 loss scaling）；BF16 尾数更少但范围同 FP32；主 GEMM 用 BF16/FP16，统计类用 FP32，TF32 是稳定与速度之间的折中。
 
 ---
 
@@ -339,14 +360,17 @@ flowchart LR
 
 **回答**
 
-- **CUDA Core**：标量 FP32/FP64 通道，每线程做简单 FMA（乘加）；按 warp 一次执行 32 条指令；
-- **Tensor Core**：专用硬件单元，**一次执行一个小矩阵乘**（如 4×4×4 或 16×16×16 MMA），**一条指令完成 4×4×4 个 MAC**。
+这两种单元做矩阵乘的方式完全不同：
 
-**为什么快这么多**：
-1. **数据复用**：Tensor Core 在片内把 A/B 的 tile 在寄存器/shared memory 复用，避免反复从 HBM 读；MAC 密度极高；
-2. **指令级并行（MMA）**：一次指令做 16×16 的稠密计算，比 32 个标量 FMA 高几个数量级的**算术吞吐/指令比**；
-3. **专用 FMA 阵列**：FP16/BF16 下 H100 Tensor Core 峰值 ~990 TFLOPS，而 CUDA core FP32 仅 ~67 TFLOPS（约 15×）；
-4. **稀疏支持**：H100 的 2:4 稀疏还能再翻倍。
+- **CUDA Core**：是走标量的通用通道（FP32/FP64 之类），每个线程做简单的 FMA（乘加）；一个 warp 一次执行 32 条指令。可以把它理解成"一个人一次搬一块砖"。
+- **Tensor Core**：是专门为矩阵乘设计的硬件单元，**一次指令就完成一个小矩阵乘**（比如 4×4×4 或 16×16×16 的 MMA），一条指令算完 4×4×4 个 MAC。相当于"一个人一次搬一整车砖"。
+
+**它为什么快这么多**：
+
+1. **数据复用**：Tensor Core 在芯片内部把 A/B 的小块放在寄存器、共享内存里反复用，避免反复去 HBM 取数，MAC 密度极高；
+2. **指令级并行（MMA）**：一条指令就做 16×16 的稠密计算，相比 32 个标量 FMA，"每指令能出的算术量"高了几个数量级；
+3. **专用 FMA 阵列**：在 FP16/BF16 下，H100 的 Tensor Core 峰值约 990 TFLOPS，而 CUDA Core 的 FP32 只有约 67 TFLOPS（差了约 15 倍）；
+4. **稀疏支持**：H100 的 2:4 稀疏还能再翻一倍。
 
 ```python
 # 概念: 峰值对比
@@ -368,7 +392,7 @@ flowchart LR
     E --> G["~990T (H100)"]
 ```
 
-**面试要点**：Tensor Core 用 **MMA 一条指令算小矩阵** + **片上复用** 获得远超标量 FMA 的算术密度；H100 差 15 倍。
+**面试要点**：Tensor Core 用 **MMA 一条指令算一个小矩阵** 加上**片上数据复用**，拿到了远超标量 FMA 的算术密度；H100 上大约差 15 倍。
 
 ---
 
@@ -376,11 +400,11 @@ flowchart LR
 
 **回答**
 
-**decode 是 memory-bound**：每生成一个 token，需要把**全部权重**（W）从 HBM 读一遍（计算量小，带宽是瓶颈）。所以：
+先记住前提：**decode 阶段是 memory-bound 的**。为什么？因为每生成一个 token，都要把**全部权重 W** 从 HBM 读一遍（算的量很小，带宽才是瓶颈）。所以速度上限可以估成：
 
 $$\text{max tokens/s} \approx \frac{BW}{W_{bytes}}$$
 
-其中 BW=显存带宽（byte/s），W_bytes=每 token 需要的权重读取（≈模型大小字节，若未量化）。
+其中 BW 是显存带宽（byte/s），W_bytes 是生成一个 token 需要读的权重字节数（不量化时约等于整个模型的字节大小）。
 
 ```python
 def decode_tps(bw_bytes_s, model_bytes):
@@ -397,7 +421,7 @@ print(f"13B (26GB)    : ≈{decode_tps(bw, 26e9):.0f} tok/s")
 13B (26GB)    : ≈77 tok/s
 ```
 
-（内存带宽实测通常只到理论值的 70-90%，且还要算 KV cache 读取与激活，实际更低。）
+（实际内存带宽一般只能到理论值的 70–90%，再加上 KV Cache 读取、激活等开销，实际数字还要再低一些。）
 
 ```mermaid
 flowchart LR
@@ -406,7 +430,7 @@ flowchart LR
     C --> D["7B/2TB/s ≈ 143 tok/s（理论）"]
 ```
 
-**面试要点**：decode 上限 = **带宽/模型大小**（每 token 都要整模型读一遍）；这是 memory-bound 的定量表现。
+**面试要点**：decode 的速度上限等于 **带宽除以模型大小**（因为每生成一个 token 都要把整个模型读一遍）；这正是 memory-bound 的定量表现。
 
 ---
 
@@ -414,13 +438,16 @@ flowchart LR
 
 **回答**
 
-- **prefill**：一次性处理整个 prompt（T 个 token），做**大矩阵乘**（B·T × d 对 W）——**算术强度高**（每读 1 字节权重做大量乘加）→ 接近 **compute-bound**；
-- **decode**：**一次只生成 1 个 token**（B×1 的形状，单 token 乘大权重矩阵）——AI = 1 token 的 FLOPs / 整模型权重字节 → **极度 memory-bound**（如同 Q2 的低 AI）。
+这两个阶段的差别，根子上是"一次处理多少个 token"的差别：
 
-**对调度的影响**：
-- prefill 吃**算力** → 系统要分配大 batch、大批量（大连续 GEMM）；
-- decode 吃**带宽** → 系统要尽量**放大 batch**（一个 batch 多个请求共享权重的读，摊薄带宽成本），并避免 GPU 空闲（continuous batching 保持按需入列）；
-- 所以 **serving 常用"prefill 与 decode 分开/混排"**：chunked prefill（把大 prompt 切成块与 decode 混跑）、分离式调度（disaggregated prefill/decode）、Continuous Batching 按两者特征混合占卡。
+- **prefill**：一次性把整个 prompt（T 个 token）都处理掉，做的是**大矩阵乘**（B·T 乘上 d 维对 W 做乘法）——算术强度高（每读 1 字节权重，能做好多次乘加），所以更接近 **compute-bound**；
+- **decode**：**一次只生成 1 个 token**（形状是 B×1，一个 token 乘上一整块大权重矩阵）——AI 等于"一个 token 的 FLOPs 除以整模型权重字节"，所以**极度 memory-bound**（就像 Q2 里那个很低的 AI）。
+
+**这对调度策略的影响**：
+
+- prefill 吃**算力**，系统要给它分配大 batch、大批量（凑成大连续 GEMM）；
+- decode 吃**带宽**，系统就要尽量**把 batch 做大**（一个 batch 里多个请求共享同一份权重的读取，把带宽成本摊薄），同时别让 GPU 闲着（用 continuous batching 按需入列）；
+- 所以 **serving 系统常见"prefill 与 decode 分开或混排"**：chunked prefill（把大 prompt 切成块，和 decode 混着跑）、分离式调度（disaggregated prefill/decode）、Continuous Batching 按两者特征混合占卡。
 
 ```python
 # AI: prefill vs decode
@@ -443,7 +470,7 @@ flowchart TB
     D --> E
 ```
 
-**面试要点**：AI 差异 = batch/seq 差异；调度核心是**把带宽型 decode 场景的 batch 做大（共享权重读）**，并用 prefill/decode 混合调度。
+**面试要点**：两者的 AI 差异，本质是 batch 和 seq 的差异；调度的核心是**把带宽型的 decode 场景 batch 做大（共享权重读取）**，并用 prefill/decode 混合调度。
 
 ---
 
@@ -451,13 +478,16 @@ flowchart TB
 
 **回答**
 
-- **训练**：收益**主要在显存与带宽**（省大 scores 矩阵）→ 可以训练更大的 batch/seq（4k→8k 等），同时前向+反向都受益；
-- **推理 prefill**：与训练类似（大 T 矩阵），**收益大**；
-- **推理 decode**：**T=1，矩阵太小**——Flash 的 tiling 主要解决"大 T 的中间矩阵"，decode 时中间矩阵只有一行，**带宽瓶颈在"权重读取"，Flash 无法消除**（它只省 attention 中间量）。
+答案是不完全一样，要看在哪个阶段算。
 
-**decode 能否套用 tiling**：不能直接照搬：
-- decode 的瓶颈是**每 token 要读全部权重**（memory-bound，Q10），Flash 的 tiling 优化的是 Q/K/V 的访问，权重读取不受影响；
-- decode 场景注意力矩阵是 `1×past`，tiling 的"大块"意义不大；实际解码用 `FlashDecoding`（Q11 第 9 章）：把 KV 切块并行算部分 attention，再合并——专为长上下文 decode 设计，是 tiling 思想在 decode 的变体而非直接复用原版。
+- **训练**：收益**主要在显存和带宽**（省掉大 scores 矩阵），于是可以训练更大的 batch/seq（比如 4k 提到 8k 等），而且前向和反向都受益；
+- **推理 prefill**：和训练类似（都是大 T 矩阵），**收益也大**；
+- **推理 decode**：**T=1，矩阵太小了**——Flash 的 tiling 主要是对付"大 T 的中间矩阵"，而 decode 时中间矩阵只有一行，真正的带宽瓶颈在"读权重"上，Flash 消不掉（它只省 attention 的中间量）。
+
+**那 decode 能不能套用 tiling**：不能直接照搬。原因有两点：
+
+- decode 的瓶颈是**每生成一个 token 就要把全部权重读一遍**（memory-bound，见 Q10），Flash 的 tiling 优化的是 Q/K/V 的访问，对权重读取没帮助；
+- decode 时注意力矩阵是 `1×past`，tiling 那种"切大块"的意义不大。实际解码用的是 `FlashDecoding`（第 9 章的 Q11）：把 KV 切块并行算出一部分 attention，再合并起来——这是专为长上下文 decode 设计的东西，属于 tiling 思想在 decode 上的变体，而不是直接复用原版。
 
 ```mermaid
 flowchart TB
@@ -466,7 +496,7 @@ flowchart TB
     C --> D["而非直接套 Flash 原版 tiling"]
 ```
 
-**面试要点**：训练/prefill 收益来自"省大 scores 矩阵"；decode 权重读取才是瓶颈，Flash 原版帮不上，用 FlashDecoding 变体。
+**面试要点**：训练和 prefill 的收益来自"省掉大 scores 矩阵"；decode 真正的瓶颈是权重读取，Flash 原版帮不上，要用 FlashDecoding 这个变体。
 
 ---
 
@@ -474,14 +504,16 @@ flowchart TB
 
 **回答**
 
-**共享内存（shared memory）角色**：
-- 是 SM 内**片上快速缓冲**（比 L2/HBM 快得多），作为**数据搬运的暂存**：GEMM 大矩阵分成 tile 后，先由全局内存 → 共享内存，再由 SM 反复从共享内存读取做乘加；
-- 发挥**数据复用**：一个 A tile 被同一行多个 C tile 复用；同一 B tile 被同列多个 C tile 复用——共享内存让这些复用**不必每次都回 HBM 取**。
+先说共享内存（shared memory）扮演什么角色：
 
-**为什么 tiling 减少 HBM 访问**：
-- 全局内存带宽最贵；tiling 后：
-  - A、B 各读**一次**到共享内存（O(n) 的 tile 遍历），然后**在片上完成整个 tile 的所有 MAC**（O(n³) 的 FLOPs 只用了 O(n²) 的 HBM traffic）；
-  - 对 GEMM：`FLOPs = 2n³`, `bytes ≈ n²`（每个 tile 读一次 A/B）——算术强度随 n 增长，**以片内复用为代价换来 HBM 访问的大幅下降**。
+- 它是 SM 内部的一块**片上高速缓冲**（比 L2、HBM 都快得多），充当**数据搬运的暂存站**。GEMM 把大矩阵切成一块块 tile 之后，先把数据从全局内存搬到共享内存，然后 SM 再从共享内存里反复读取来做乘加；
+- 它的价值在于**数据复用**：同一块 A tile 会被同一行的多个 C tile 用到，同一块 B tile 会被同一列的多个 C tile 用到——有了共享内存，这些复用就**不用每次都跑回 HBM 去取**。
+
+**为什么 tiling 能减少 HBM 访问**：
+
+- 全局内存带宽是最贵的。tiling 之后：
+  - A、B 各自**只读一次**进共享内存（遍历一遍 tile 即可，O(n) 量级），然后**在片上把整个 tile 的所有 MAC 都做完**（O(n³) 的 FLOPs 只花了 O(n²) 的 HBM 流量）；
+  - 拿 GEMM 来说：`FLOPs = 2n³`，`bytes ≈ n²`（每个 tile 读一次 A/B）——算术强度随 n 增长，**用片内复用换来了 HBM 访问量的大幅下降**。
 
 ```python
 def gemm_hbm_traffic(n, block=64):
@@ -499,7 +531,7 @@ flowchart TB
     C --> D["HBM 访问 O(n²) 而FLOPs O(n³) → AI随规模升"]
 ```
 
-**面试要点**：共享内存=片上复用缓冲；tiling 使"每个 tile 的 A/B 只进一次 HBM、片上做所有 MAC"，把 AI 从 O(1) 提到 O(n)。
+**面试要点**：共享内存是片上的复用缓冲；tiling 让"每个 tile 的 A/B 只进一次 HBM，之后所有 MAC 都在片上做"，把 AI 从 O(1) 提到了 O(n)。
 
 ---
 
@@ -507,13 +539,14 @@ flowchart TB
 
 **回答**
 
-**影响**：L2 命中率高 → 少走 HBM（慢几十倍）→ 吞吐提高；对**大矩阵乘与 attention**，L2 命中可把一些重复访问从 HBM 提到片上。
+**先讲影响有多大**：L2 命中率高，就意味着更多的访问能在片上解决、少走慢几十倍的 HBM，吞吐自然就上去了。对大矩阵乘和 attention 来说，好的 L2 命中能把一部分重复访问从 HBM 拉到片上。
 
-**L2 局部性差的天然场景**：
-1. **大权重矩阵的一遍流式读取**：decode 阶段每 token 一次把**全部权重流式读一遍**（Q10）——权重 > L2，每次都不命中，L2 帮不上（这是 decode memory-bound 的本质）；
-2. **稀疏/不规则访问**：MoE 的专家选择、PagedAttention 的分页块（逻辑块映射到分散物理块）——非顺序访问 L2 退化；
-3. **K/V Cache 超长扫描**：长上下文的 attention 读远端 K/V（跨块）、conv 的跨通道步长访问。
-4. 随机 gather（embedding 的 index 查表，如果 index 很分散）。
+**哪些操作的 L2 局部性天生就不好**：
+
+1. **大权重矩阵的一遍流式读取**：decode 阶段每个 token 都要把**全部权重从头到尾流式读一遍**（见 Q10）——权重比 L2 大得多，每次访问都命中不了，L2 帮不上忙（这正是 decode 是 memory-bound 的本质）；
+2. **稀疏、不规则的访问**：比如 MoE 选专家、PagedAttention 的分页块（逻辑块映射到分散的物理块）——不是顺序访问，L2 的效果就变差；
+3. **超长 K/V Cache 的扫描**：长上下文 attention 会去读很远的 K/V（跨块访问），还有卷积跨通道的步长访问；
+4. 随机 gather（比如 embedding 的 index 查表，如果 index 分布很散）。
 
 ```python
 # 概念: 流式权重的 L2 不命中
@@ -530,7 +563,7 @@ flowchart LR
     C --> D["吞吐受限, 只能靠batch摊薄"]
 ```
 
-**面试要点**：权重/长 KV 超过 L2 → 流式访问必然 miss；decode 的"每 token 读全部权重"天然 L2 局促，所以 memory-bound。
+**面试要点**：权重和长 KV 一旦超过 L2，流式访问就必然 miss；decode 的"每个 token 读全部权重"让它天然 L2 局促，因此是 memory-bound。
 
 ---
 
@@ -538,21 +571,23 @@ flowchart LR
 
 **回答**
 
-**必须保持 FP32 的算子**：
-1. **归一化（LayerNorm/RMSNorm）内部统计**：mean/var 与 `1/√var`；
-2. **交叉熵/loss**：logits 与 label 的 softmax+log 计算（BF16 下 exp/log 下溢/溢出）；
-3. **softmax 的指数与求和**（数值敏感）；
-4. **优化器状态 m/v 与 master weights**（Q3 第 2 章）；
-5. **attention 的 logits 中 score 很多项相加**（可视实现用 FP16+稳定技巧，但更稳妥 FP32 累积）；
-6. **embedding 的小数步更新与 loss scaling 相关**。
+**哪些算子必须留在 FP32**：
 
-**强切 BF16 会先崩在哪**：
-- **最可能在"统计/归一化 + 交叉熵"处**：BF16 只有 2-3 位有效数字，
-  - exp(logits) 溢出/下溢 → loss=NaN 或 inf；
-  - LayerNorm 的 `1/√(var+ε)` 下游崩；
-  - 交叉熵里 `-log p` 的极小值 → 梯度 NaN；
-- 其次**梯度下溢**：小梯度在 BF16 中变 0，参数更新断流 → 训练卡住/发散；
-- 应对：保持 FP32 关键节点（或对 BF16 加 loss scaling 变体），**不要全局 BF16**。
+1. **归一化（LayerNorm / RMSNorm）内部的统计量**：mean、var，以及 `1/√var`；
+2. **交叉熵 / loss**：logits 和 label 一起算 softmax 再取 log 的那一段（BF16 下 exp/log 很容易下溢或溢出）；
+3. **softmax 的指数运算与求和**（数值很敏感）；
+4. **优化器状态 m/v 和 master weights**（第 2 章 Q3）；
+5. **attention 里 logits 大量项累加的那一步**（可视实现常用 FP16 加稳定技巧，但更稳妥的还是 FP32 累积）；
+6. **embedding 的小步更新，以及和 loss scaling 相关的部分**。
+
+**强切全 BF16 会先崩在哪里**：
+
+- **最可能先崩在"统计/归一化 + 交叉熵"这一带**：BF16 只有 2–3 位有效数字，
+  - `exp(logits)` 容易溢出或下溢，导致 loss 变成 NaN 或 inf；
+  - LayerNorm 里的 `1/√(var+ε)` 一旦算歪，下游就跟着崩；
+  - 交叉熵里 `-log p` 遇到极小的概率值，梯度就变 NaN；
+- 其次会崩在**梯度下溢**：小梯度在 BF16 里直接变成 0，参数更新断流，训练就卡住或发散；
+- 应对办法：关键节点保留 FP32（或者对 BF16 加 loss scaling 变体），**千万不要全局一刀切 BF16**。
 
 ```python
 import torch
@@ -577,21 +612,22 @@ flowchart LR
     E --> F["BF16只用于大 GEMM 前向反向"]
 ```
 
-**面试要点**：必须 FP32 = **norm 统计、loss/交叉熵、softmax exp、优化器状态**；强切 BF16 先崩在 exp/norm/loss 的 NaN 与梯度下溢。
-
----
+**面试要点**：必须用 FP32 的是 **norm 统计、loss/交叉熵、softmax 的 exp、优化器状态**；硬切 BF16 会先在 exp/norm/loss 上爆出 NaN、再让梯度下溢。
 
 ## Q16. 解释 element-wise 融合与 reduction 融合的区别。softmax 属于哪一类，融合难度在哪？
 
 **回答**
 
-- **element-wise 融合**：多个逐元素运算（relu、add、mul、bias）在**同一数据形状**上串起来，无跨元素依赖 → 一个 kernel 一遍读写完成全部（如 `x = sigmoid(x)·y + z`），**无 reduction，易于并行**；
-- **reduction 融合**：涉及**跨元素聚合**（sum/max/mean）且通常在中间态下依赖整个 chunk 的结果（如 softmax 需要"整行的 sum"），**有跨线程/跨块依赖** → 融合时要处理同步与局部 reduction。
+这两种融合的区别，在于**运算之间有没有跨元素的依赖**：
 
-**softmax 属于 reduction 融合**：需要**行级 max 与 sum（reduction）**，且与分母归一、乘 V 等串联。融合难度在于：
-1. **两遍依赖**：标准 softmax 要"先算 max（减少覆盖）→ 再算 exp 和 sum"，两个 reduction，且第二次要读第一次的 max → 不止一遍；
-2. **跨块 reduction**：一行可能很大（长序列），需跨多个 warp/block reduction + 同步；
-3. 现金的 **online softmax（Flash）** 通过 running max/sum 一遍完成——本质是把"两遍 reduction"变"一遍增量 reduction"，这就是融合的主要难点所在。
+- **element-wise 融合**：把多个逐元素运算（relu、add、mul、bias 之类）在**同一块形状的数据**上串起来，彼此之间没有跨元素的依赖。比如 `x = sigmoid(x)·y + z`，一个 kernel 从头到尾读一遍、算一遍、写一遍就能完成，**没有 reduction（不依赖整行的汇总结果），天然好并行**；
+- **reduction 融合**：涉及**跨元素聚合**（sum/max/mean），而且常常要依赖整个 chunk 汇总之后的结果（比如 softmax 得知道整行的和），**存在跨线程、跨块的依赖**。所以融合时得处理同步和局部的 reduction。
+
+**softmax 属于哪一类**：属于 reduction 融合。它需要**行级 max 和 sum 两次 reduction**，还要和分母归一、乘 V 等步骤串起来。它的融合难度体现在：
+
+1. **两遍依赖**：标准 softmax 要先算 max（防溢出），再算 exp 和 sum，这是两次 reduction，而且第二次要读第一次算出的 max——所以不是一遍能走完的；
+2. **跨块 reduction**：一行可能特别长（长序列），需要跨多个 warp/block 做 reduction 还要同步；
+3. 现代的 **online softmax（Flash）** 用 running max/sum 一遍走完——本质是把"两遍 reduction"变成"一遍增量 reduction"，这正是 softmax 融合的主要难点所在。
 
 ```python
 # softmax 需要两次 reduction（max, sum）
@@ -611,7 +647,7 @@ flowchart LR
     C --> F["分类: reduction 融合"]
 ```
 
-**面试要点**：element-wise 无依赖、reduction 有跨元素聚合；softmax 属 reduction，难点是 **max+sum 两次 reduction 与跨块同步**（Flash 用 running 技巧一次解决）。
+**面试要点**：element-wise 没有依赖、reduction 有跨元素聚合；softmax 属于 reduction，难在 **max+sum 两次 reduction 及跨块同步**（Flash 用 running 技巧一次就解决）。
 
 ---
 
@@ -619,14 +655,16 @@ flowchart LR
 
 **回答**
 
-- **T=128 时**：`B·H·T²` 中间矩阵很小，**省带宽的收益大幅缩水**——Flash 的 tiling 省的是大 T 的 HBM 传输，短 T 时这些传输本身就少，**收益趋近于 0 甚至更差**（多余的分块/同步开销）。
-- **短序列下瓶颈转移**：
-  1. **kernel 启动/调度开销**（很多小 kernel 的启动成本占主导）；
-  2. **算术效率（小矩阵乘的 SM 利用率低）**——单 token/短 batch 的 GEMM 破坏了 Tensor Core 的大矩阵效率；
-  3. **CPU/驱动延迟**（eager 模式下每 op 的 Python 与驱动调用）；
-  4. 若 batch 也小：整体"算力不足/带宽闲置"，瓶颈是**延迟（latency）而非吞吐**。
+**T=128 这种短序列，Flash 的收益会大幅缩水**。因为 `B·H·T²` 的中间矩阵本身就很小的，Flash 的 tiling 省的是"大 T 时的 HBM 传输"，短 T 时这些传输本来就少，收益趋近于 0 甚至为负（多出来的分块和同步开销反而成了负担）。
 
-**启示**：短序列/单 token decode 场景，优化重点转向 **kernel 融合、CUDA Graph、批量放大、权重带宽**——不是 Flash 的 tiling 主线（呼应 Q11/Q12）。
+**短序列下瓶颈会转移到哪里**：
+
+1. **kernel 启动和调度开销**：很多小 kernel 的启动成本占了大头；
+2. **算术效率低**：小矩阵乘的 SM 利用率上不去——单 token、短 batch 的小 GEMM 根本喂不饱 Tensor Core；
+3. **CPU 和驱动延迟**（eager 模式下每个 op 都要走一遍 Python 和驱动调用）；
+4. 如果 batch 也小，整体就会"算力没用满、带宽也闲着"，瓶颈变成**延迟（latency）**而不是吞吐。
+
+**启示**：短序列、单 token 的 decode 场景，优化重点要转向 **kernel 融合、CUDA Graph、批量放大、权重带宽**——而不是 Flash 的 tiling 主线（呼应 Q11、Q12）。
 
 ```python
 def flash_gain(T, d):
@@ -652,7 +690,7 @@ flowchart TB
     E["T大(4096+)"] --> F["Flash 收益显著"]
 ```
 
-**面试要点**：短 T 时 Flash 省带宽的收益消失；瓶颈转移到 **kernel 启动、小 GEMM 算术效率、延迟**——优化用 CUDA Graph / 融合 / batch 放大，而非 tiling。
+**面试要点**：短 T 时 Flash 省带宽的收益会消失；瓶颈转移到 **kernel 启动、小 GEMM 的算术效率、延迟**——这种场景要用 CUDA Graph、融合、放大 batch 来优化，而不是 tiling。
 
 ---
 
@@ -660,14 +698,14 @@ flowchart TB
 
 **回答**
 
-公式（每 token、每个 K/V、每层、每头）：
+先给公式（含义：每个 token、每个 K/V、每层、每头各占多少）：
 
 $$\text{KV} = 2 \times L \times H_{kv} \times d \times \text{bytes} \times T \times B$$
 
-- `2`：K 与 V 各一份；
-- L：层数；H_kv：KV 头数；d：head_dim；T：序列长度；B：batch；bytes：每元素字节（FP16=2）。
+- `2`：K 和 V 各一份；
+- L：层数；H_kv：KV 头数；d：head_dim；T：序列长度；B：batch；bytes：每个元素占几个字节（FP16 是 2）。
 
-**给定数值**：L=32, H_kv=32, d=128, T=8192, B=16, FP16(2B)
+**代入给定数值**：L=32, H_kv=32, d=128, T=8192, B=16, FP16（2 字节）
 
 ```
 KV = 2 × 32 × 32 × 128 × 2 × 8192 × 16
@@ -702,7 +740,7 @@ flowchart LR
     F --> G["= 68.7GB (本例)"]
 ```
 
-**面试要点**：公式 `2·L·H_kv·d·bytes·T·B`；本例算 68.7GB——足以见 KV Cache 是长上下文显存大头，GQA 可除 4。
+**面试要点**：公式是 `2·L·H_kv·d·bytes·T·B`；本例算出 68.7GB——足以看出 KV Cache 是长上下文场景的显存大头，用 GQA 可以除 4。
 
 ---
 
@@ -710,16 +748,18 @@ flowchart LR
 
 **回答**
 
-**加速原理**：
-- 量化把权重从 FP16（2B）压到 4-bit/8-bit（0.5/1B）→ **decode 阶段要读的权重字节少 4–8 倍** → memory-bound 场景（Q10）直接**提升 tok/s 4–8 倍**；
-- 同时**显存更小**，可容纳更大 batch/模型；
-- 推理时用 Tensor Core 的 INT8/INT4 运算（算力也高），若底层支持 INT4 GEMM 则再加速。
+**加速的底层原理**：
+
+- 量化把权重从 FP16（2 字节）压到 4-bit/8-bit（0.5/1 字节），于是 **decode 阶段要读的权重字节少了 4–8 倍**，而对 memory-bound 的场景（见 Q10）来说，这直接等于 **tok/s 提升 4–8 倍**；
+- 同时**显存用量也更小**，能塞下更大的 batch 或更大的模型；
+- 推理时还能用 Tensor Core 的 INT8/INT4 运算（算力也高），如果底层支持 INT4 GEMM，还能再加速一层。
 
 **为什么不是所有层都适合低 bit**：
-1. **敏感层（sensitivity）**：某些层对权重扰动极敏感（如 attention 的 QKV 投影、输出层、第一/最后几层）→ 低 bit 后精度崩；
-2. **异常值（outliers）**：权重/激活里有少数大值（outlier）主导精度，低 bit 在这些上损失大（AWQ 就是保护这类）;
-3. **embedding 与 norm**：embedding 的表示与 logits 尺度敏感；norm 不需量化（太小）;
-4. 层与层的重要性不同——GPTQ/AWQ 用**校准集+误差最小化**逐层选策略，而不是统一 bit。
+
+1. **敏感层（sensitivity）**：有些层对权重扰动特别敏感（比如 attention 的 QKV 投影、输出层、第一层和最后一层）——一旦低 bit，精度就崩；
+2. **异常值（outliers）**：权重或激活里少数特别大的值主导着精度，低 bit 在它们身上损失最大（AWQ 正是专门保护这类值的算法）；
+3. **embedding 和 norm**：embedding 的表示和 logits 的尺度很敏感；norm 层太小，无需量化；
+4. 各层的重要性本来就不同——GPTQ/AWQ 的做法是**用校准集加上误差最小化，逐层选策略**，而不是对所有层统一用同一个 bit 数。
 
 ```python
 # 4bit 加速估算
@@ -740,7 +780,7 @@ flowchart LR
     E --> F["GPTQ/AWQ 逐层选策略: 误差最小化"]
 ```
 
-**面试要点**：量化省**权重读取字节** → decode memory-bound 直接提速；敏感层/outlier 使"统一低 bit"不可行，需逐层策略。
+**面试要点**：量化省的是**权重读取的字节数**，所以在 decode memory-bound 场景直接提速；敏感层和异常值的存在，让"全层统一低 bit"行不通，需要逐层制定策略。
 
 ---
 
@@ -748,18 +788,20 @@ flowchart LR
 
 **回答**
 
-**融合边界**：两个相邻算子能否合一 kernel，取决于**数据流形状一致 + 无跨元素的 reduction/同步障碍 + 布局（layout/内存格式）允许**。
+**融合边界（fusing boundary）** 就是指"两个相邻算子能不能合成一个 kernel"。能不能合，取决于三个条件：**数据流的形状是否一致**、**有没有跨元素的 reduction / 同步障碍**、**基本布局（layout，也就是内存格式）是否允许**。
 
-**可以融合**：
-- **逐元素链**（elementwise 连续）：`bias+relu+mul`、`norm 的 scale+bias`、`layernorm 尾步与线性头部`——同形状、无 reduction，最易；
-- **elementwise + 少量 reduction 的尾段**：softmax 前后与乘 V 融合（Flash 已做）；
-- **卷积+激活 / GEMM+bias+gelu**（同 layout）。
+**可以融合的**：
 
-**难以融合**：
-1. **跨元素 reduction 依赖**（如一行 max 用在另一行的计算）——需要全行后才有结果，不能按元素流水；
-2. **布局变换**：`NCHW → NHWC` 的 transpose 需要真实重排内存；FP32→FP16 输入转换等格式转换不便融合；
-3. **跨块/跨 SM 依赖**：需要对全局数据做 reduction 后再广播（如 BatchNorm 的全局统计）；
-4. **conditional/投票**：需要全局决策后再执行的（如 MoE 的按专家分组前的路由决策）。
+- **逐元素链**（连续的 elementwise 运算）：像 `bias+relu+mul`、norm 的 `scale+bias`、layernorm 的尾步和线性头的拼接——形状相同、没有 reduction，最容易融合；
+- **elementwise + 少量 reduction 的尾段**：softmax 前后和乘 V 融合（FlashAttention 就是这么做的）；
+- **卷积+激活 / GEMM+bias+gelu**（布局一致）。
+
+**难以融合的**：
+
+1. **跨元素的 reduction 依赖**：比如"某一行算出 max，用到另一行的计算里"——必须整行先算完才有结果，没法按元素流水；
+2. **布局变换**：像 `NCHW → NHWC` 的 transpose 需要真实重排内存；FP32→FP16 这种输入格式转换也不方便融合；
+3. **跨块、跨 SM 的依赖**：需要先对全局数据做 reduction 再广播回去的（比如 BatchNorm 的全局统计）；
+4. **条件 / 投票类**：需要先做出全局决策再执行的（比如 MoE 在按专家分组之前要先做路由决策）。
 
 ```python
 # 可融合 vs 不可
@@ -777,7 +819,7 @@ flowchart TB
     D --> E
 ```
 
-**面试要点**：融合边界由**数据依赖与内存布局**决定——逐元素链可融，跨块 reduction/布局变换/全局决策不可（或需特殊技巧）。
+**面试要点**：融合边界由**数据依赖和内存布局**决定——逐元素链可以融合，跨块 reduction、布局变换、全局决策就没法直接融合（或者得用特殊技巧）。
 
 ---
 
@@ -785,14 +827,15 @@ flowchart TB
 
 **回答**
 
-**Occupancy** = 每个 SM 上**驻留的活动线程块数 / 最大可驻留数**（或活动线程占比）。它衡量并发度：高 occupancy → 更多 warp 可切换掩盖延迟。
+**Occupancy（占用率）** = 每个 SM 上**实际驻留的活动线程块数，占最大可驻留数的比例**（也有人用活动线程占比来衡量）。它反映的是并发度：occupancy 越高，就有越多的 warp 可以切换来掩盖延迟。
 
-**高 occupancy ≠ 必然性能好**（反例）：
-1. **寄存器/共享内存受限的高占用 kernel**：occupancy 高但每线程寄存器太多 → 触发 **register spilling**（压到局部内存 → 走 HBM）→ 反而爆慢；
-2. **occupancy 高但重用少**：每个 warp 只做少量工作就退出（小额 elementwise），SM 利用率看似高但总吞吐低；
-3. **compute-bound 且任务已满**：对纯算力受限的大 GEMM，挤更多 warp 只会争抢 SM 的 FP32 单元，无增益甚至下降（memory 模型占用高无益）。
+**但"高 occupancy"不等于"性能一定好"**，反例有几个：
 
-所以 occupancy 是**必要条件非充分**：要在 "够高的并发掩盖延迟" 与 "避免资源过载导致 spilling/争抢" 间平衡。
+1. **寄存器、共享内存受限的高占用 kernel**：occupancy 看着高，但如果每个线程用的寄存器太多，会触发 **register spilling（寄存器溢出，数据被压到局部内存，实际上走 HBM）**——反而爆慢；
+2. **occupancy 高但复用少**：每个 warp 只干一点点活就退出（比如很小的 elementwise），SM 利用率看起来高，总吞吐却很低；
+3. **compute-bound 且任务已满**：对纯算力受限的大 GEMM，硬塞更多 warp 只会争抢 SM 的运算单元，没有增益甚至下降（此时堆高 occupancy 没有意义）。
+
+所以 occupancy 是**必要条件，不是充分条件**——要在"并发足够掩盖延迟"和"别让资源过载导致 spilling 或争抢"之间找平衡。
 
 ```python
 # 概念: 寄存器→spill 反例
@@ -813,7 +856,7 @@ flowchart TB
     B --> E["占用高不是万灵丹，需平衡"]
 ```
 
-**面试要点**：occupancy=驻留并发度；**反例 = 高寄存器导致 spill**、小额 kernel 的"假占用"、compute-bound 争抢——占用高非性能保证。
+**面试要点**：occupancy 就是驻留的并发度；**反例是"高寄存器导致的 spill"、小 kernel 的"假占用"、compute-bound 时的争抢**——占用率高并不保证性能好。
 
 ---
 
@@ -821,16 +864,18 @@ flowchart TB
 
 **回答**
 
-**长序列下为什么要担心数值**：
-- softmax 需要对**整行**的 T 个 score 做 `exp`；长 T（如 65k）下 score 分布可能**跨度大**（少数大值+很多小值），直接 `exp(x)` **会溢出（大值→inf）或下溢（小值→0）**，导致 NaN 或精度损失；
-- 保存完整 `T×T` 分数矩阵还会占爆显存（Q3）。
+**长序列下为什么数值会出问题**：
 
-**Flash 如何不实例化完整矩阵完成归一化**：
-- **分块 + online softmax（running max/sum）**（Q4）：
-  - 从头到尾保持 `(m, s)`（已见部分的最大值、Σexp(x−m)）；
-  - 每到一个块：`m' = max(m, block_max)`，`s' = s·exp(m−m') + Σexp(block − m')`；
-  - 这样**全程减最大值得小于 0 的指数**（最坏 0，不会大于 0）→ **数值稳定**，且不需要知道全局最大就能得到等价结果；
-- 因为有 running max，**每块在本地归一并重缩放**，最终输出与一次性全局 softmax **逐位一致**（用正确的数学恒等式），而分数矩阵从不落在 HBM 上。
+- softmax 需要对**一整行**的 T 个 score 做 `exp`；当 T 很大（比如 65k）时，这行 score 的取值可能**跨度非常大**（少数大值带着一大串小值），直接 `exp(x)` 会**溢出（大值变成 inf）或者下溢（小值变成 0）**，结果就是 NaN 或精度损失；
+- 另外，保存完整的 `T×T` 分数矩阵还会把显存撑爆（见 Q3）。
+
+**Flash 怎样在不实例化完整矩阵的情况下完成归一化**：
+
+- 靠 **分块 + online softmax（running max/sum）**（见 Q4）：
+  - 从头到尾维护一个 `(m, s)`（分别记"已经看过部分的最大值"和"Σexp(x−m)"）；
+  - 每处理一个块：`m' = max(m, block_max)`，`s' = s·exp(m−m') + Σexp(block − m')`；
+  - 这样就能**全程减掉最大值，保证指数始终是小于等于 0 的数**（最坏等于 0，不会大于 0），数值自然稳定；而且不需要提前知道全局最大值，算出来的结果照样等价；
+- 因为有这个 running max，**每块都在本地归一并重缩放**，最终输出和一次性全局 softmax **逐位一致**（用的都是正确的数学恒等式），而那个巨大的分数矩阵从头到尾都不落进 HBM。
 
 ```python
 def online_softmax(x, tile=4):
@@ -862,7 +907,7 @@ flowchart LR
     D --> E["完整分数矩阵从不落 HBM → 显存+数值双稳"]
 ```
 
-**面试要点**：长序列 exp 溢出是数值瓶颈；Flash 用 **running max/sum 全程减 max** 保持指数 ≤0，分块完成且不实例化 T×T 矩阵。
+**面试要点**：长序列里 exp 溢出是数值瓶颈；Flash 用 **running max/sum 全程减 max** 让指数保持 ≤0，既完成了分块归一化，又从不实例化 T×T 的矩阵。
 
 ---
 
@@ -870,13 +915,14 @@ flowchart LR
 
 **回答**
 
-- **prefill（compute-bound，大矩阵）**：适合**张量并行（TP）**把大 GEMM 分摊到多卡，配合 batching 增大利用率；
-- **decode（memory-bound, 单 token 小矩阵）**：**不适合大 TP**（通信开销>收益），通常用**数据并行（DP）/ 分片服务（shard serving）**、把多请求 batch 在一个卡上并行（bandwidth 共享），或用 **分离式（disagg prefill/decode）**。
+- **prefill（compute-bound，大矩阵）**：适合用**张量并行（TP）**把大 GEMM 分摊到多张卡，再配合 batching 把算力利用率拉高；
+- **decode（memory-bound，单 token 小矩阵）**：**不适合大 TP**（通信开销比收益还大），通常用**数据并行（DP）/ 分片服务（shard serving）**，把多个请求放进同一个 batch 在一张卡上并行（共享带宽），或者用**分离式（disagg prefill/decode）**把二者拆开调度。
 
 **Chunked prefill 解决的问题**：
-- 长 prompt 的 prefill 会**独占 GPU 很长时间**，把 **decode 的 inter-token latency**（TPOT 每 token 延迟）拖高（排队等待）；
-- chunked prefill：把长 prompt **切成多个 chunk**，把 prefill 计算**穿插到 decode 请求之间**执行 → 让 decode 请求的 token 延迟不被长 prefill 垄断；
-- 效果：**降低首 token 与生成延迟、提高整体吞吐**（在延迟与吞吐间 trade-off，Q14 第 9 章）。
+
+- 一个很长的 prompt 在做 prefill 时会**独占 GPU 很长时间**，把后面 decode 请求的 **inter-token latency（TPOT，每个 token 的生成延迟）** 拖得很高（因为要排队等）；
+- chunked prefill 的做法：把长 prompt **切成多个 chunk**，把 prefill 的计算**穿插到 decode 请求之间**去跑——这样 decode 请求的 token 延迟就不会被长 prefill 完全垄断；
+- 效果：**降低首 token 时间和生成延迟，提高整体吞吐**（本质是在延迟与吞吐之间做 trade-off，详见第 9 章 Q14）。
 
 ```python
 # 概念: chunked prefill 交错
@@ -894,7 +940,7 @@ flowchart TB
     B --> D["TPOT 不被长 prefill 拖垮 / 吞吐↑"]
 ```
 
-**面试要点**：prefill 用 TP（算力）、decode 用 DP/大 batch（带宽）；Chunked prefill 把长 prompt 切片穿插到 decode 间 → 保 TPOT。
+**面试要点**：prefill 用 TP 吃算力、decode 用 DP 和大 batch 吃带宽；Chunked prefill 把长 prompt 切成片穿插进 decode 之间，保住 TPOT。
 
 ---
 
@@ -902,19 +948,19 @@ flowchart TB
 
 **回答**
 
-判断性能是否合理，用**分层基准**：
+判断性能合不合理，建议用**分层基准**的思路：
 
-1. **与理论峰值比（roofline）**：算该 op 的 AI（Q2），对照硬件峰值——若 memory-bound，理论上限=带宽×AI；用实测/理论算利用率（如 ≥70% 算达标）；
-2. **与成熟库比**：
-   - GEMM 类（大矩阵）：目标 **85–95% × cuBLAS**（Triton 差距多在 10% 内）；
-   - elementwise/小 kernel：目标 **≥90% × 手写 CUDA**，或直接认为"有得上90%"即可；
-   - 复杂融合 op（如 attention）：目标 **≥90–100% × Flash 官方**；
-3. **可接受"容忍度"参考**：
-   - 大 GEMM：≥90% cuBLAS 可接受;
-   - attention/融合：≥85–95% 官方实现;  
-   - 自定义/特殊 op：只要**高于 naive 实现 2 倍+** 且接近带宽/算力上限即可，不用强追最优。
+1. **对理论峰值比（roofline）**：先算这个 op 的 AI（见 Q2），对照硬件峰值——如果它是 memory-bound，理论上限就是带宽乘 AI；用实测值除以理论值算利用率（一般 ≥70% 就算达标）；
+2. **和成熟库比**：
+   - GEMM 类（大矩阵）：目标 **85–95% 的 cuBLAS**（Triton 通常差距在 10% 以内）；
+   - elementwise、小 kernel：目标 **≥90% 的手写 CUDA**，或者直接认为"能上到 90% 就很好了"；
+   - 复杂的融合 op（比如 attention）：目标 **≥90–100% 的 Flash 官方实现**；
+3. **可接受的"容忍度"参考**：
+   - 大 GEMM：≥90% cuBLAS 可接受；
+   - attention/融合：≥85–95% 官方实现；
+   - 自定义/特殊 op：只要**比 naive 实现快 2 倍以上**、且接近带宽或算力上限就可以了，不必强追最优。
 
-**验证工具**：`torch.utils.benchmark`，ncu/nvtx profile，比较 LAUNCH 与 kernel 时间、检查 occupancy 与 coalescing。
+**验证工具**：`torch.utils.benchmark`，ncu / nvtx profile，比较 LAUNCH 时间和 kernel 时间，检查 occupancy 与 coalescing（内存合并访问）。
 
 ```python
 def perf_check(mine_ms, ref_ms, label):
@@ -941,13 +987,15 @@ flowchart TB
     C --> F["大GEMM≥90%cuBLAS / 融合≥85-95%官方"]
 ```
 
-**面试要点**：三层基准——**roofline 理论、cuBLAS/Flash 参照、naive 提升**；容忍度=大 GEMM 90% cuBLAS、融合 op 85–95% 官方即合理。
+**面试要点**：三层基准——**roofline 理论上限、cuBLAS/Flash 参照、比 naive 有提升**；容忍度大致是"大 GEMM 到 cuBLAS 的 90%、融合 op 到官方的 85–95% 就算合理"。
 
 ---
 
 ## Q25. GPU 显存层级（寄存器、shared memory、L1/L2、HBM）的带宽与延迟各是什么量级？为什么寄存器溢出会严重拖慢性能？
 
 **回答**
+
+先记住这张层级表（量级是大概值，感受趋势即可）：
 
 | 层级 | 延迟 | 带宽量级 | 说明 |
 |---|---|---|---|
@@ -956,10 +1004,11 @@ flowchart TB
 | L1/L2 | ~30~200 周期 | 数 TB/s（片内） | 缓存 |
 | HBM（全局） | ~500 周期 | 1–3 TB/s | 最慢最宽 |
 
-**寄存器溢出为何灾难**：
-- 寄存器不够 → 编译器把部分变量**压到"本地内存"（local memory，实为 HBM/私有空间）** —— 访问延迟从 ~1 周期跳到 ~500 周期 + 带宽限制；
-- 每个被溢出的变量都要走 HBM：**每步计算都要等内存** → 吞吐崩塌（可能数量级下降）；
-- 且溢出变量在循环里反复读写 → 每轮都付 HBM 代价。
+**寄存器溢出为什么是灾难**：
+
+- 寄存器不够用时，编译器会把一部分变量**压到"本地内存"（local memory，其实就落在 HBM 上）**——访问延迟从约 1 个周期直接跳到约 500 个周期，还受带宽限制；
+- 每个被溢出的变量都要走一遍 HBM：**每一步计算都要等内存**，吞吐自然崩塌（可能掉一个数量级）；
+- 而且溢出的变量如果出现在循环里，会被反复读写——每一轮循环都要付一次 HBM 的代价。
 
 ```python
 # 概念: 寄存器→HBM 的延迟跳变
@@ -977,7 +1026,7 @@ flowchart LR
     D --> F["延迟×500 + 带宽受限 → 性能雪崩"]
 ```
 
-**面试要点**：层级表记住"寄存器→shared→L1/L2→HBM"，延迟 1→20→100→500 量级；**溢出=变量走 HBM** → 每个访问都付 500 周期 → 拖垮。
+**面试要点**：层级表记住"寄存器→shared→L1/L2→HBM"，延迟量级是 1→20→100→500；**溢出 = 变量掉进 HBM**，每次访问都要付 500 个周期，所以能把性能彻底拖垮。
 
 ---
 
@@ -985,18 +1034,21 @@ flowchart LR
 
 **回答**
 
-**原理**：用一个**更小/更快的 draft 模型**先自回归生成 k 个候选 token，再用**目标大模型并行验证**（一次前向检查 k 个位置的 next token 分布）。若候选与目标模型一致，则**一个大步验证多个 token**——大模型的串行步数从 k+1 降到 1，而每步成本只略增（小 draft 便宜）。
+**原理**：用一个**更小、更快的 draft 模型**先去自回归地生成 k 个候选 token，再用**目标大模型一次性并行验证**（一次前向检查这 k 个位置的 next token 分布，看候选和大模型自己会预测的是否一致）。如果候选跟目标模型对得上，那**一大步就同时验证了多个 token**——大模型的串行步数从 k+1 降到 1，而每步的成本只是略微增加（小 draft 很便宜）。
 
-**加速比限制**：
+**加速比受什么限制**：
+
 $$\text{speedup} \approx \frac{1 - \alpha^{k+1}}{(1-\alpha)(1 + c k)}$$
-- α=接受率（每位置的校正/接受概率）、k=draft 长度、c=draft 相对 target 的每 token 成本比；
-- 受 **α（越小越慢）**、**k（太长不划算——验证越贵）**、**c（draft 越贵越不划算）** 限制；
-- 批次只接受"连续一致前缀"，一旦遇到分歧要回退重生成。
 
-**draft 质量影响**：
-- draft 越好（α 高）→ 一次验证通过更多 token → 加速比大；
-- draft 与 target 分布偏离大 → α 低 → 大量验证被打回 → 退化回逐 token（加速≈1），甚至更慢（多付 draft 成本）；
-- 所以主流用**同 family 的蒸馏 dege 版** 或 **draft via target 自身的前几层**（保证接近）。
+- α=接受率（每个位置候选被接受的概率）、k=draft 长度、c=draft 相对 target 每个 token 的成本比；
+- 主要受 **α（越小越慢）**、**k（太长不划算，验证变贵）**、**c（draft 越贵越不划算）** 三个因素限制；
+- 还有一个细节：批次只接受"连续一致的前缀"，一旦某个位置出现分歧，后面要回退重新生成。
+
+**draft 质量的影响**：
+
+- draft 越好（α 越高），一次验证通过的 token 越多，加速比越大；
+- draft 和 target 分布差得越远，α 越低，大量验证会被打回，退化成逐 token（加速≈1），甚至更慢（白白多付了 draft 的成本）；
+- 所以主流的做法是**用同一家族的蒸馏小模型**，或者**用 target 自身的前几层当 draft**（保证分布足够接近）。
 
 ```python
 def speedup(alpha, k, c):
@@ -1020,7 +1072,7 @@ flowchart LR
     C --> E["加速比 ∝ (1-α^(k+1))/((1-α)(1+ck))"]
 ```
 
-**面试要点**：投机解码=**小 draft 猜 + 大模型并行验证**；加速受 α、k、c 制约；draft 质量=α 的核心决定因素。
+**面试要点**：投机解码就是"**小 draft 先猜 + 大模型并行验证**"；加速受 α、k、c 制约；draft 的质量是决定 α 的核心因素。
 
 ---
 
@@ -1028,13 +1080,14 @@ flowchart LR
 
 **回答**
 
-- **静态 batching**：把请求**攒够一个固定批次**一起跑；**batch 内完成时长由最慢的请求决定**——先完成的请求**占着位置等**（GPU 空闲/浪费），新请求要等下一批（空档期）；
-- **Continuous batching（连续批处理，in-flight 调度）**：**请求按需动态加入/离开**——一个请求一生成完就**立即释放资源**，新请求随时插入**同一个 batch** 的"空位"。
+- **静态 batching（静态批处理）**：把请求**攒够一个固定批次再一起跑**；关键问题是——**整批跑完的时间由最慢的那个请求决定**，所以先完成的请求只能**占着位置干等**（GPU 空转浪费），而新到的请求又得等下一批（中间有空档期）；
+- **Continuous batching（连续批处理，也叫 in-flight 调度）**：请求**按需动态加入、动态离开**——某个请求一旦生成完就**立刻释放资源**，新请求随时插入**同一个 batch** 的空位，不用等整批一起结束。
 
-**如何提高 decode 利用率**：
-- decode 是 memory-bound（Q10）——**同一时间 GPU 内存带宽要被尽量多的活跃请求共享**（一起读同一权重，摊薄带宽成本）；
-- 连续 batching 让 batch **始终近似满**（无等待浪费）→ **带宽利用率高**、吞吐提升；
-- 它通常搭配 **PagedAttention**（Q6）：分页让"动态插入/退出"的显存分配高效（Q33 第 9 章会讲二者"互相需要"）。
+**它怎么提高 decode 阶段的利用率**：
+
+- decode 是 memory-bound（见 Q10），所以**同一时间最好有尽量多的活跃请求共享 GPU 的内存带宽**（一起读同一份权重，把带宽成本摊薄）；
+- 连续 batching 让 batch **始终接近满负荷**（没有空等的浪费），带宽利用率高、吞吐自然上去；
+- 它通常和 **PagedAttention**（见 Q6）搭着用：分页让"动态插入、退出"时的显存分配变得高效（第 9 章 Q33 会专门讲两者为什么"互相需要"）。
 
 ```python
 # 示意: 静态 vs 连续
@@ -1042,7 +1095,7 @@ def static_util(requests, batch=8):
     # 慢请求拖全批 → 平均利用率低
     return sum(requests)/ (len(requests)//batch * batch * max(requests[0:batch])) 
 ```
-（概念：静态批中先完成的请求空等，连续批即时补位。）
+（概念上：静态批里先完成的请求只能空等，连续批能即时补位。）
 
 ```mermaid
 flowchart TB
@@ -1052,7 +1105,7 @@ flowchart TB
     E --> F["配套 PagedAttention（显存动态管理）"]
 ```
 
-**面试要点**：静态"集批等最慢"、连续"动态进出"；连续 batching 让 decode 带宽时刻被共享 → 高利用率。
+**面试要点**：静态是"集批等最慢的"，连续是"动态进出"；连续 batching 让 decode 的带宽时刻被共享，从而利用率更高。
 
 ---
 
@@ -1060,15 +1113,15 @@ flowchart TB
 
 **回答**
 
-- decode 时每 token 要读**全部权重**一次（W 字节），但**矩阵乘的 FLOPs** 随 batch 增大而增大——**同一次权重读取可以被 batch 里多个 token/请求复用**：
-  `AI(batch) = B·(单token的FLOPs) / W_bytes` → 每多一个 token 在一个"权重读取周期"里多做一份计算，AI 线性增长；
-- 到 **AI > ridge（算力/带宽，Q2）** 时 decode 从 memory-bound 转 compute-bound：`AI > P/B` → `B > P/(单tokenFLOP·W)`。
+- decode 时每个 token 都要把**全部权重 W** 读一次（W 字节），但**矩阵乘的 FLOPs 会随 batch 增大而增大**——因为**同一次权重读取可以被 batch 里多个 token / 请求复用**：
+  `AI(batch) = B·(单token的FLOPs) / W_bytes`——每多一个 token，就在同一个"权重读取周期"里多做一份计算，所以 AI 是线性增长的；
+- 当 **AI 超过 ridge（算力/带宽，见 Q2）** 时，decode 就从 memory-bound 转为 compute-bound：`AI > P/B` 等价于 `B > P/(单tokenFLOP·W)`。
 
-**临界 batch**（近似）：单 token decode 的 FLOPs≈2·N（每 token 每参数 2 次乘加），则临界：
+**临界 batch 怎么估**（近似）：单 token decode 的 FLOPs 约等于 2·N（每个 token 对每个参数做 2 次乘加），于是临界 batch 约等于：
 
 $$B^* \approx \frac{P/BW \cdot W_{bytes}}{2N \cdot \text{(利用率)}}$$
 
-对 7B、H100（P=989T, BW=3.35TB/s）：`AI_ridge≈295`；单 token AI≈2N/W=2·7e9/14e9=1 → 需 B≈295 才够（理论）；但实际利用率+KV 读取缩短基数，实用上 B=几十~几百 时趋向 compute-bound（实测 13B 上 B~128 附近接近交叉）。
+拿 7B 模型、H100（P=989T，BW=3.35TB/s）来算：`AI_ridge≈295`；单 token AI≈2N/W=2·7e9/14e9=1 → 理论上要 B≈295 才够；但实际还要考虑利用率、KV 读取会消掉一部分基数，所以实用上 B 到几十到几百时就趋于 compute-bound（实测 13B 模型在 B≈128 附近接近交叉）。
 
 ```python
 P, BW = 989e12, 3.35e12
@@ -1090,7 +1143,7 @@ flowchart LR
     C --> D["临界 batch = ridge/AI_tok（~百量级）"]
 ```
 
-**面试要点**：AI 随 batch 线性涨（复用权重读）；临界 batch≈ridge/单token-AI，百量级——这是"何时 decode 转 compute-bound"的估算。
+**面试要点**：AI 随 batch 线性增长（因为复用同一次权重读取）；临界 batch ≈ ridge 除以单 token 的 AI，数量级在百左右——这就是"decode 什么时候会变成 compute-bound"的估算方法。
 
 ---
 
@@ -1098,14 +1151,16 @@ flowchart LR
 
 **回答**
 
-**相似处**：
-- 都是**按块/按 segment 反复读取的中间态**：训练 activation 沿反向被重新利用；推理 KV 被后续每个新 token 读取（长上下文多次读同一段 KV）；
-- 都有**"部分可重用、部分一次性"**的特征：attention 常常只用近段 KV / 特定层的激活；
-- 都有**时间局部性**：新 token 主要访问最近的 KV（训练中相邻 token 的激活也相似）。
+**相似之处**：
 
-**Flash tiling 能否迁移到 KV Cache 管理**：
-- **可以（部分迁移）**：FlashDecoding 已经把 KV 切块并行算 attention 再合并——本质是"分块+复用"思想在推理的运用；管理侧，PagedAttention 的分块也是"固定块缓冲+块表"（tiling 的显存管理版）；
-- **限制**：KV cache 的瓶颈不仅是带宽，还包括**显存容量与分配（块淘汰、共享、预分配）**，tiling 本身不解决碎片/容量，需要配合分块管理、滑动窗口、量化等。
+- 两者都是**按块、按 segment 反复读取的中间状态**：训练的 activation 会在反向传播时被重新利用；推理的 KV 会被后面每一个新 token 读取（长上下文里会多次读同一段 KV）；
+- 都有**"一部分可重用、一部分只用一次"**的特征：attention 往往只用最近一段 KV、只用到特定层的激活；
+- 都有**时间局部性**：新 token 主要访问最近的 KV（训练里相邻 token 的激活也很相似）。
+
+**Flash 的 tiling 能不能迁移到 KV Cache 管理**：
+
+- **可以（部分迁移）**：FlashDecoding 已经把 KV 切块并行算 attention 再合并——本质就是"分块 + 复用"的思想用在推理侧；管理层面，PagedAttention 的分页也是"固定块缓冲 + 块表"（相当于 tiling 思想的显存管理版）；
+- **但有局限**：KV Cache 的瓶颈不只是带宽，还包括**显存容量和分配方式**（块淘汰、共享、预分配）。tiling 本身不解决碎片化和容量问题，还需要配合分块管理、滑动窗口、量化等手段一起用。
 
 ```python
 # 概念: 训练激 kail tuning 类似物 → 推理 KV 分块复用
@@ -1125,7 +1180,7 @@ flowchart TB
     D --> E["但 KV 管理还涉及容量/碎片/分配（非纯带宽）"]
 ```
 
-**面试要点**：共性=**中间态分块反复读**；Flash tiling 迁移=FlashDecoding（KV 分块）+ PagedAttention（分块缓冲），但显存管理还需分区/淘汰策略。
+**面试要点**：共性在于**中间态被分块反复读**；Flash 的 tiling 迁移到推理就是 FlashDecoding（KV 分块）和 PagedAttention（分块缓冲），但 KV 管理还涉及容量、碎片、分配，需要额外的淘汰与分区策略。
 
 ---
 
@@ -1133,15 +1188,15 @@ flowchart TB
 
 **回答**
 
-优先级排序（结合单卡、延迟敏感）：
+结合单卡、且目标是延迟敏感的场景，优先级可以这样排：
 
-1. **量化（权重 W4A/W8A）**：decode 是 memory-bound（权重读取），**量化直接降权重字节 → 延迟/吞吐最大杠杆**；单卡上必先做；
-2. **CUDA Graph**：把 eager 的多次 kernel 启动固化成图，**大幅消除 launch + 驱动开销**（decode 小 kernel 阶段尤其有效，Q14 第 6 章），几乎零成本、稳定低延迟；
-3. **FlashAttention / FlashDecoding**：prefill/长上下文大矩阵省带宽；decode 时作用有限但对 prefill 与长上下文显著；
-4. **投机解码**：需要额外 draft 模型/部署复杂度，加速取决于 α（可能不稳），**在主要节省都做完后作为第二层加速**；
-5. **KV Cache 压缩（滑动窗口/H2O/GQA 之外）**：**主要作用于长上下文显存与占用**，对"短上下文延迟"影响小——放后面，长序列/大 batch 才启用。
+1. **量化（权重 W4A/W8A）**：decode 是 memory-bound（权重读取），**量化直接降权重的字节数 → 这是延迟和吞吐的最大杠杆**；单卡上必须先做；
+2. **CUDA Graph**：把 eager 模式下一次次的 kernel 启动固化成一张图，**大幅消掉 launch 和驱动的开销**（decode 的小 kernel 阶段特别有效，见第 6 章 Q14），几乎零成本、延迟稳定；
+3. **FlashAttention / FlashDecoding**：对 prefill 和长上下文的大矩阵很省带宽；decode 时作用有限，但对首 token 时间和长上下文收益明显；
+4. **投机解码**：需要额外准备 draft 模型，部署复杂度更高，加速效果取决于 α（可能不稳定），**应该在主要节省都做完之后，再当第二层加速用它**；
+5. **KV Cache 压缩（滑动窗口 / H2O / GQA 之外的手段）**：**主要作用于长上下文的显存占用**，对"短上下文延迟"影响很小——放到最后，做长序列、大 batch 时才启用。
 
-**一句话优先级逻辑**：**先砍 memory 瓶颈（量化）、再砍调度开销（CUDA Graph）、再攻计算（Flash）、再上猜测（投机）、最后压缩 KV（长场景）**。
+**一句话优先级逻辑**：**先砍 memory 瓶颈（量化）→ 再砍调度开销（CUDA Graph）→ 再攻计算（Flash）→ 再上猜测（投机解码）→ 最后压缩 KV（长场景）**。
 
 ```python
 # 单卡 7B 延迟构成（示意）
@@ -1161,7 +1216,7 @@ flowchart TB
     E --> F["逻辑: 带宽→调度→计算→猜测→KV"]
 ```
 
-**面试要点**：把"瓶颈占比最大的先动"——**量化（带宽）、CUDA Graph（调度）、Flash（计算）、投机（α）、KV压缩（长程）**。答案要讲清理由排序。
+**面试要点**：按"哪块占的瓶颈最大就先动哪块"来排——**量化（带宽）、CUDA Graph（调度）、Flash（计算）、投机解码（α）、KV 压缩（长程）**。回答时一定要把每项的理由讲清楚。
 
 ---
 
@@ -1169,7 +1224,7 @@ flowchart TB
 
 1. [你的 GPU 为什么在摸鱼？——存储金字塔、带宽瓶颈与 Roofline 模型-CSDN博客](https://blog.csdn.net/weixin_68710508/article/details/160566369)
 2. [FlashAttention原理与工程落地：突破GPU显存带宽瓶颈-CSDN博客](https://blog.csdn.net/weixin_29056145/article/details/169331422)
-3. [Flash Attention原理与实战：突破GPU显存带宽瓶颈-CSDN博客](https://blog.csdn.net/weixin_31992389/article/details/161299450)
+3. [FlashAttention原理与实战：突破GPU显存带宽瓶颈-CSDN博客](https://blog.csdn.net/weixin_31992389/article/details/161299450)
 4. [FlashAttention（V1）深度解析：公式推导+原理+硬件+实现-CSDN博客](https://blog.csdn.net/xuebinding/article/details/151622363)
 5. [FlashAttention适配老架构GPU：数据流优化与工程验证-CSDN博客](https://blog.csdn.net/weixin_29062613/article/details/168998905)
 6. [LLM 推理性能优化：从显存管理到推理加速的全链路方案-CSDN博客](https://blog.csdn.net/dicky_zhang3/article/details/162190131)
