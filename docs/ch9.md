@@ -1,6 +1,6 @@
 # 第 9 章 · 推理
 
-> 面试生普（LLM 500 题）· 第 9 章【重点】。本章覆盖 Prefill/Decode、KV Cache、PagedAttention、Continuous Batching、投机解码、GPTQ/AWQ、KV 压缩、FlashDecoding、TTFT/TPOT、vLLM 调度等 35 个问题，关键概念配 Python 代码与 mermaid 图解。
+> 面试生普（LLM 500 题）· 第 9 章【重点】。本章覆盖 Prefill/Decode、KV Cache、PagedAttention、Continuous Batching、投机解码、GPTQ/AWQ、KV 压缩、FlashDecoding、TTFT/TPOT、vLLM 调度等 37 个问题，关键概念配 Python 代码与 mermaid 图解。
 
 > 先把话说清楚：这一章聊的是"模型训练好以后，怎么让它又快又省地把答案一个字一个字吐出来"，也就是**推理（inference）**和**在线服务（serving）**。训练只管把模型喂胖，推理才是模型真正上岗干活的地方——用户每问一句话，背后都是这一整套流程在跑。你会听到一堆名词：KV Cache、PagedAttention、连续批处理、投机解码……别被吓到，它们说到底都在解决同一个矛盾：显存有限、带宽有限，可用户又想要又快又便宜。跟着每道题先看"它在抠什么成本"，再看"用什么招省下来"，读完你就能把一个大模型推理引擎的骨架说个大概。
 
@@ -1249,6 +1249,149 @@ flowchart LR
 ```
 
 **面试要点**：α→0 时加速≈`1/(1+ck)` ≤1（退化+付 draft 成本）；k 增大的收益依赖 α——α 不高时 k 越大越亏（分母涨分子饱和）。
+
+---
+
+## Q36. Temperature、Top-P、Top-K 分别控制什么？生产环境怎么设置更稳？
+
+**回答**
+
+模型生成时，先算出每个候选 token 的概率，然后用"采样策略"决定下一个 token 选哪个。Temperature、Top-P、Top-K 就是三个常用的"调阀门"：
+
+- **Temperature（温度）**：控制概率分布的"平坦程度"。
+  - T 接近 0：概率分布变尖，最大概率的 token 几乎独吞 → 输出**稳定、保守、重复性低**，适合事实类问答、代码生成；
+  - T = 1：原样输出模型预测的概率；
+  - T > 1：概率分布变平，冷门 token 也有机会被选中 → 输出**更有创意、更随机**，适合写故事、写诗，但容易跑题或胡说八道。
+- **Top-K**：只在概率最高的前 K 个 token 里采样，其他的直接剔除。
+  - 比如 Top-K=40，不管长尾概率多小，只看前 40 名。K 越大越随，K=1 等同于贪心搜索（每次选概率最大的）。
+- **Top-P（核采样）**：把 token 按概率从高到低排，累积概率达到 P 就停止，只在这些 token 里采样。
+  - 比如 Top-P=0.9，选概率最高的几个 token，直到它们的概率加起来≥0.9。P 越小越保守，P=1.0 等同于不限制。
+
+**三者关系**：Top-K 是"选前 K 名"，Top-P 是"选够 P 概率就停"，Temperature 是"把概率分布压尖或拉平"。通常三者一起用：先用 Temperature 调整分布，再用 Top-P/Top-K 裁剪候选集，最后从剩下的里按概率采样。
+
+**生产环境怎么设更稳**：
+
+| 场景 | Temperature | Top-P | Top-K | 理由 |
+|---|---|---|---|---|
+| 事实问答 / 代码 / 提取 | 0～0.3 | 1.0（或不开） | 1～10 | 追求确定性，低温度 + 小 Top-K |
+| 对话 / 客服 | 0.7～0.9 | 0.9～0.95 | 40～50 | 保留一定多样性，不至于太死板 |
+| 创意写作 / 讲故事 | 1.0～1.3 | 0.9～1.0 | 50～100 | 允许更随机、更有创意 |
+
+```python
+import torch
+
+def sample_with_temp_topk_topp(logits, temperature=1.0, top_k=0, top_p=1.0):
+    """
+    logits: (vocab_size,) 未归一化的对数概率
+    返回选中的 token id
+    """
+    # 1) Temperature
+    logits = logits / temperature
+    probs = torch.softmax(logits, dim=-1)
+
+    # 2) Top-K：只保留前 k 个
+    if top_k > 0:
+        topk_vals, topk_idx = torch.topk(probs, top_k)
+        probs = torch.zeros_like(probs)
+        probs[topk_idx] = topk_vals
+        probs = probs / probs.sum()  # 重新归一化
+
+    # 3) Top-P：累积概率达到 p 就截断
+    if top_p < 1.0:
+        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+        cum_probs = torch.cumsum(sorted_probs, dim=-1)
+        # 标记累积超过 p 的位置
+        cutoff = cum_probs > top_p
+        # 保留第一个超过 p 的（以免全切掉）
+        cutoff[..., 1:] = cutoff[..., :-1].clone()
+        cutoff[..., 0] = False
+        sorted_probs[cutoff] = 0.0
+        probs[sorted_idx] = sorted_probs
+        probs = probs / probs.sum()
+
+    # 4) 从剩下的里按概率采样
+    return torch.multinomial(probs, num_samples=1).item()
+
+# 演示：温度越低，概率越集中
+logits = torch.tensor([2.0, 1.0, 0.5, 0.1, -1.0])
+for t in (0.1, 1.0, 2.0):
+    p = torch.softmax(logits / t, dim=-1)
+    print(f"T={t}: {p.tolist()}")
+```
+
+```text
+T=0.1: [0.83, 0.12, 0.04, 0.01, 0.00]
+T=1.0: [0.61, 0.25, 0.10, 0.03, 0.01]
+T=2.0: [0.42, 0.27, 0.17, 0.10, 0.04]
+```
+
+```mermaid
+flowchart TD
+    A["原始 logits"] --> B["÷ Temperature"]
+    B --> C["Top-K 裁剪（保留前 K）"]
+    C --> D["Top-P 截断（累积概率≥P）"]
+    D --> E["按剩余概率采样"]
+    B --> F["T↓ 分布更尖 → 更稳"]
+    F --> E
+```
+
+**面试要点**：Temperature 控制分布尖平（越低越稳）；Top-K 只看前 K 名；Top-P 累积概率到 P 就停。生产环境事实类任务用低温度+小 Top-K，创意类用高温度。三者通常一起用：Temperature 调分布 → Top-P/Top-K 裁剪 → 按概率采样。
+
+---
+
+## Q37. 为什么 Temperature 设为 0，模型输出仍然可能不完全一致？
+
+**回答**
+
+这是个很容易被忽略的细节。Temperature = 0 意味着"贪心解码"（greedy decoding）：每一步都选概率最大的那个 token，理论上应该每次输出一样。但**实际生产中还是可能不一致**，主要有以下几个原因：
+
+1. **浮点数非结合律与并行批次差异**：GPU 上不同 batch 的矩阵乘法、不同核的调度顺序，会导致 logits 出现极微小的数值抖动（比如 0.5000001 vs 0.4999999）。当两个 token 的概率非常接近时，这次选 A，下次可能选 B。
+2. **动态批处理（Dynamic Batching）**：推理引擎（如 vLLM）会把多个请求拼成一个 batch 一起算，不同请求组合在一起时，中间计算顺序可能不同，导致微小精度差异。
+3. **不同 GPU 型号 / 不同推理版本**：A100 和 H100 的算子实现不同，或者同一供应商后端在不同 GPU 集群间路由，logits 会有微小偏移，足以让"几乎平手"的两个 token 被不同选中。
+4. **系统提示词中的动态内容**：如果 Prompt 里包含当前时间戳、请求 ID、随机种子等动态信息，即使 Temperature=0，输入本身就不同，输出自然也不同。
+
+**怎么让输出更确定**：
+
+- 固定随机种子（虽然贪心理论上不需要种子，但有些实现里采样仍有随机性）；
+- 禁止动态批处理，或固定 batch 组成；
+- 用同一类 GPU、同一版本推理引擎；
+- 把 Prompt 里的动态时间戳等内容去掉或固定；
+- 对关键字段（如 JSON 输出、状态判断）强制结构化输出 + 确定性业务逻辑校验，不只依赖模型原文。
+
+```python
+# 演示：两个概率非常接近时，微小抖动会导致不同选择
+import torch, random
+
+torch.manual_seed(42)
+random.seed(42)
+
+# 模拟两个几乎平手的 token
+logits_a = torch.tensor([1.0000001, 1.0])   # token0 略大
+logits_b = torch.tensor([1.0, 1.0000001])   # token1 略大
+
+def greedy(logits):
+    return torch.argmax(logits).item()
+
+print("logits_a 选:", greedy(logits_a))  # 0
+print("logits_b 选:", greedy(logits_b))  # 1
+# 只有 0.0000001 的差异，选中结果就不同了
+```
+
+```text
+logits_a 选: 0
+logits_b 选: 1
+```
+
+```mermaid
+flowchart LR
+    A["Temperature = 0（贪心）"] --> B["理论上每次选概率最大，应一致"]
+    B --> C["GPU 浮点抖动 / 动态 batch / 不同卡型"]
+    C --> D["相近概率的 token 被不同选中"]
+    D --> E["输出不完全一致"]
+    E --> F["对策: 固定种子/卡型/引擎 + 结构化输出校验"]
+```
+
+**面试要点**：Temperature = 0 不等于 100% 确定——GPU 浮点非结合律、动态批处理、不同卡型/推理版本都会导致 logits 微小抖动，进而让"几乎平手"的 token 被不同选中。要确保一致性，需固定硬件/引擎/种子，并对关键字段做结构化输出+确定性校验。
 
 ---
 

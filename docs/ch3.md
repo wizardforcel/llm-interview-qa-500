@@ -1,6 +1,6 @@
 # 第 3 章 · 语言模型架构与训练细节
 
-> 面试生普（LLM 500 题）· 第 3 章【重点】。本章覆盖多头注意力、Pre/Post-LN、RMSNorm、SwiGLU、RoPE、ALiBi、GQA、残差、位置编码、外推与长上下文等 35 个问题，关键概念配 Python 代码与 mermaid 图解。
+> 面试生普（LLM 500 题）· 第 3 章【重点】。本章覆盖多头注意力、Pre/Post-LN、RMSNorm、SwiGLU、RoPE、ALiBi、GQA、残差、位置编码、外推与长上下文等 37 个问题，关键概念配 Python 代码与 mermaid 图解。
 
 > 先把话说清楚：这一章聊的是大模型"身体里"最核心的几个零件——注意力怎么算、块与块之间怎么归一化、位置信息怎么塞进去、词表和输出头怎么设计。你不需要先懂多少深度学习的底子，跟着每题从"为什么要这么设计"讲到"代码长什么样"，读完就能把一张 Transformer 的架构图画个七八分。题多（35 个），但不难啃，每题的"回答"讲原理、"面试要点"给你一句拿去背的浓缩版。
 
@@ -1624,6 +1624,140 @@ flowchart TB
 ```
 
 **面试要点**：动态 NTK 与静态 NTK 的区别在于**是否随当前长度实时重算 base**；动态要处理"每步重算、KV 元数据、算子改造"的复杂度；serving 里 base 因长度不同，会造成**缓存失效与行为不一致**。
+
+---
+
+## Q36. Prefix LM 和 Causal LM 的区别是什么？各自适合什么场景？
+
+**回答**
+
+先把两个名字拆开来看：
+
+- **Causal LM（因果语言模型，"单向看"）**：只能看到**当前位置之前**的 token，预测下一个 token。就像你读一本小说，只能翻到当前页，不能偷看后面的情节。GPT 系列、LLaMA、Qwen 这类生成式大模型都是 Causal LM。
+- **Prefix LM（前缀语言模型，"前面可双向"）**：给定一个"前缀"（prefix），前缀内部可以**双向自注意**（像 BERT 一样互相看），但前缀之后的生成部分仍然是**单向因果**的。T5、UL2 等模型用过这套思路。
+
+**直观对比**：
+
+```
+Causal LM:  [我 喜 欢 吃 苹 林]   ← 每个位置只能看左边
+             ↑ 只向左看，不能看右边
+
+Prefix LM:  [我 喜 欢 | 吃 苹 林]   ← 前缀"我 喜 欢"内部可以双向看
+              ↑   双向自注意   ↑   生成部分仍单向因果
+```
+
+**为什么要分两种**？
+
+- Causal LM 天然适合**生成**（续写、对话、代码补全），因为它天然就是"看左边猜右边"。
+- Prefix LM 适合**条件生成/填空类任务**：比如"已知前缀是一段英文，生成对应的中文翻译"，前缀里的词可以互相参考，翻译质量通常更好；但它对纯生成场景的优势不如 Causal LM 明显，工业界主流生成模型还是以 Causal LM 为主。
+
+```python
+def causal_mask(T):
+    """Causal LM：位置 i 只能看到 j <= i"""
+    import torch
+    return torch.tril(torch.ones(T, T)) == 1
+
+def prefix_mask(T, prefix_len):
+    """Prefix LM：前缀内双向，前缀之后单向因果"""
+    import torch
+    mask = torch.zeros(T, T, dtype=torch.bool)
+    # 前缀内部：双向可见
+    mask[:prefix_len, :prefix_len] = True
+    # 前缀之后：只能看到自己及之前（含前缀）
+    for i in range(prefix_len, T):
+        mask[i, :i+1] = True
+    return mask
+
+# 示例：T=6, prefix_len=3
+print(causal_mask(6))
+print("----")
+print(prefix_mask(6, 3))
+```
+
+```text
+tensor([[ True, False, False, False, False, False],
+        [ True,  True, False, False, False, False],
+        [ True,  True,  True, False, False, False],
+        [ True,  True,  True,  True, False, False],
+        [ True,  True,  True,  True,  True, False],
+        [ True,  True,  True,  True,  True,  True]])
+----
+tensor([[ True,  True,  True, False, False, False],
+        [ True,  True,  True, False, False, False],
+        [ True,  True,  True, False, False, False],
+        [ True,  True,  True,  True, False, False],
+        [ True,  True,  True,  True,  True, False],
+        [ True,  True,  True,  True,  True,  True]])
+```
+
+```mermaid
+flowchart LR
+    A["Causal LM"] --> B["每位只向左看"]
+    B --> C["适合生成/对话/续写"]
+    D["Prefix LM"] --> E["前缀内双向，之后单向"]
+    E --> F["适合条件生成/翻译/填空"]
+    C --> G{"选哪种取决于任务"}
+    F --> G
+```
+
+**面试要点**：Causal LM = 单向因果，适合生成；Prefix LM = 前缀双向+后缀单向，适合条件生成/翻译。工业界主流生成式大模型基本都是 Causal LM。
+
+---
+
+## Q37. 什么情况下该用 BERT 模型，什么情况下该用 LLaMA、ChatGLM 类大模型？
+
+**回答**
+
+简单一句：**想"理解"文本用 BERT，想"生成"文本用 LLaMA/ChatGLM。**
+
+- **BERT 类（编码器式，Encoder-only）**：本质是个"阅读理解机"。它一次性把整句话读进来，双向自注意，每个词都能看见句子里所有其他词。训练目标是遮蔽语言模型（MLM）和下一句预测（NSP），所以它擅长**分类、抽取、匹配**——比如情感分析、命名实体识别（NER)、文本相似度、意图识别。但它**不会续写**，不能直接用来做对话或写文章。
+- **LLaMA / ChatGLM 类（解码器式，Decoder-only，Causal LM）**：本质是个"续写机"。它只能看左边，预测下一个 token，训练目标是自回归语言建模。擅长**生成**——对话、写作、代码补全、翻译。经过 SFT/RLHF 后还能做指令遵循。但它做精细的"抽取/分类"通常不如 BERT 直接，需要提示工程或微调。
+
+**选型参考表**：
+
+| 你要做的事 | 推荐模型 | 理由 |
+|---|---|---|
+| 情感分析（正面/负面） | BERT | 分类任务，双向编码更准 |
+| 命名实体识别（人名/地名） | BERT | Token 级抽取，精度高 |
+| 文本相似度/语义匹配 | BERT | 双向编码后算余弦相似 |
+| 对话机器人 / 写作 | LLaMA / ChatGLM | 自回归生成，能连续吐 token |
+| 代码补全 | LLaMA / ChatGLM | 左上下文补全右侧代码 |
+| 指令遵循（按指令做任务） | LLaMA / ChatGLM（SFT后） | 对话格式更自然 |
+
+当然，现在很多场景下大模型（Decoder-only）也能做分类和抽取，只是通常需要更多的 prompt 工程或少量样本；反之，BERT 基本不能直接做生成。如果两者都能做，优先选**能直接解决问题、部署更轻**的那个——BERT 小、快、便宜，适合纯理解类任务；大模型大、慢、贵，但能做更复杂的生成任务。
+
+```python
+def choose_model(task):
+    understanding = {"情感分析", "命名实体识别", "文本相似度", "意图识别", "文本分类"}
+    generation = {"对话", "写作", "代码补全", "翻译", "指令遵循", "摘要生成"}
+    if task in understanding:
+        return "BERT（编码器式，小、快、便宜）"
+    if task in generation:
+        return "LLaMA / ChatGLM（解码器式，生成能力强）"
+    return "看具体场景，理解类优先 BERT，生成类优先大模型"
+
+for t in ("情感分析", "对话机器人", "命名实体识别", "代码补全"):
+    print(f"{t:8s} -> {choose_model(t)}")
+```
+
+```text
+情感分析  -> BERT（编码器式，小、快、便宜）
+对话机器人 -> LLaMA / ChatGLM（解码器式，生成能力强）
+命名实体识别 -> BERT（编码器式，小、快、便宜）
+代码补全 -> LLaMA / ChatGLM（解码器式，生成能力强）
+```
+
+```mermaid
+flowchart TD
+    A["任务：理解还是生成？"] --> B["理解：分类/抽取/匹配"]
+    A --> C["生成：对话/写作/补全"]
+    B --> D["选 BERT：双向编码，小快省"]
+    C --> E["选 LLaMA/ChatGLM：自回归生成"]
+    D --> F["BERT 不会续写"]
+    E --> G["大模型重、慢、贵，但能生成"]
+```
+
+**面试要点**：BERT = 理解机（编码器，双向，擅长分类/抽取，不能生成）；LLaMA/ChatGLM = 生成机（解码器，单向因果，擅长对话/写作/代码补全）。选型核心看任务是"理解"还是"生成"，并兼顾部署成本。
 
 ---
 
