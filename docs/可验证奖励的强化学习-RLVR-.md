@@ -1,4 +1,4 @@
-# 第 13 章 · 可验证奖励的强化学习（RLVR）
+# 可验证奖励的强化学习（RLVR）
 
 > 面试生普（LLM 500 题）· 第 13 章【重点】。本章覆盖 RLVR vs 经典 RLHF、GRPO 简化、组内相对优势、验证器与 reward hacking、Outcome/Process Reward、DeepSeek-R1 流程、KL 约束、样本效率、多答案验证器、稀疏奖励、RFT 关系、验证器噪声等 35 个问题，关键概念配 Python 代码与 mermaid 图解。
 

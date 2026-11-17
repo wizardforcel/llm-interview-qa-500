@@ -1,4 +1,4 @@
-# 第 1 章 · 分词器（BPE / Unicode）
+# 分词器（BPE / Unicode）
 
 > 面试生普（LLM 500 题）· 第 1 章。本章覆盖 BPE、字节级 BPE、Unicode 规范化、词表设计、分词器评估等 30 个问题，关键概念配 Python 代码与 mermaid 图解。
 

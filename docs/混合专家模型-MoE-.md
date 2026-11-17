@@ -1,4 +1,4 @@
-# 第 4 章 · 混合专家模型（MoE）
+# 混合专家模型（MoE）
 
 > 面试生普（LLM 500 题）· 第 4 章【重点】。本章覆盖 MoE 的总参/激活参数、Top-K 路由、专家坍塌、负载均衡、容量因子、Z-Loss、All-to-All、DeepSeekMoE、稀疏 GEMM、EP/TP 组合等 35 个问题，关键概念配 Python 代码与 mermaid 图解。
 

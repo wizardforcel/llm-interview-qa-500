@@ -1,4 +1,4 @@
-# 第 6 章 · GPU 高性能编程
+# GPU 高性能编程
 
 > 面试生普（LLM 500 题）· 第 6 章。本章覆盖 CUDA 三层线程模型、Triton 与手写 CUDA 的取舍、GEMM/FlashAttention 内核、Warp 原语、寄存器溢出、Coalesced 访问、Tensor Core、CUDA Graph、Persistent Kernel、autotune 等 30 个问题，关键概念配 Python（Triton 风格）代码与 mermaid 图解。
 

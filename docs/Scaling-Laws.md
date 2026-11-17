@@ -1,4 +1,4 @@
-# 第 8 章 · Scaling Laws
+# Scaling Laws
 
 > 面试生普（LLM 500 题）· 第 8 章。本章覆盖 Kaplan 2020 vs Chinchilla 2022、compute-optimal、token/参数分配、幂律外推、数据质量、涌现、多模态/MoE scaling 等 30 个问题，关键概念配 Python 代码与 mermaid 图解。
 

@@ -1,4 +1,4 @@
-# 第 14 章 · 多模态模型（CLIP → LLaVA → Omni）
+# 多模态模型（CLIP → LLaVA → Omni）
 
 > 面试生普（LLM 500 题）· 第 14 章。本章覆盖 CLIP 对比学习、LLaVA 架构与两阶段训练、projector、视觉 token 设计、Qwen-VL 位置编码、Chameleon 原生多模态、视觉指令数据、幻觉、视频、多模态评测、模态遗忘等 30 个问题，关键概念配 Python 代码与 mermaid 图解。
 
