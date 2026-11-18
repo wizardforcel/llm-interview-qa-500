@@ -64,6 +64,22 @@
 
 ### 高级 RAG 架构 —— 知识图谱 RAG（GraphRAG）与多模态 RAG
 
+### GPU 与 ROCm 环境准备 —— 9070XT、Ubuntu、ROCm 与 WSL2 边界
+
+### GPU 体系结构与编程模型 —— wavefront、线程层级与显存访问
+
+### HIP 编程基础与性能计时 —— 第一个 HIP 程序、GPU 计时与可信 benchmark
+
+### GPU Profiling 与性能优化实战 —— rocprof、kernel trace 与 Roofline 图
+
+### 经典 GPU 算子与 Kernel 实战 —— Element-Wise、Reduction、Normalization、GEMM-Like、Fusion 与 Fused RMSNorm
+
+### 算子优化 Agent —— Agent 入门、工具封装、算子优化 Agent 设计与多轮优化
+
+### LLM 推理系统建模与性能校准 —— Roofline 瓶颈、显存/KV Cache 估算、量化误差预算与通信代价
+
+### 推理集群与端侧部署 —— 模型并行、服务排队与 SLA、端侧部署及负载启发集群
+
 ## 历史记录
 
 - 2026-11-18：新增智能体方向 11 个类别——初识智能体、智能体发展史、智能体经典范式构建、基于低代码平台的智能体搭建、框架开发实践、构建你的Agent框架、记忆与检索、上下文工程、智能体通信协议、Agentic-RL、智能体性能评估。
@@ -74,4 +90,5 @@
 - 2026-11-18：扩充《数据工程》正文至 35 个 QA。
 - 2026-11-18：扩充《评估与基准测试》正文至 35 个 QA。
 - 2026-11-18：新增 RAG 方向 6 个类别——RAG 基础入门、RAG 数据准备、RAG 索引构建、RAG 检索进阶、RAG 生成与评估、高级 RAG 架构。
+- 2026-11-18：新增 GPU 与推理系统方向 8 个类别——GPU 与 ROCm 环境准备、GPU 体系结构与编程模型、HIP 编程基础与性能计时、GPU Profiling 与性能优化实战、经典 GPU 算子与 Kernel 实战、算子优化 Agent、LLM 推理系统建模与性能校准、推理集群与端侧部署。
 
