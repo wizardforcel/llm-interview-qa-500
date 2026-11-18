@@ -1,3 +1,4 @@
 - [低代码平台章节扩充至 35 QA](memory/low-code-agent-platform-35-qa.md) — 《基于低代码平台的智能体搭建》已从 10 个 QA 扩充至 35 个 QA 并推送至 master。
 - [构建Agent框架章节扩充至 35 QA](memory/build-agent-framework-35-qa.md) — 《构建你的Agent框架》已从 25 个 QA 扩充至 35 个 QA 并推送至 master。
 - [记忆与检索章节扩充至 35 QA](memory/memory-and-retrieval-35-qa.md) — 《记忆与检索》已从 9 个 QA 扩充至 35 个 QA 并推送至 master。
+- [上下文工程章节扩充至 35 QA](memory/context-engineering-35-qa.md) — 《上下文工程》已从 10 个 QA 扩充至 35 个 QA 并推送至 master。
