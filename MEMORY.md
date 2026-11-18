@@ -5,3 +5,4 @@
 - [框架开发实践章节扩充至 30 QA](memory/framework-development-practice-30-qa.md) — 《框架开发实践》已从 10 个 QA 扩充至 30 个 QA 并推送至 master。
 - [Agentic-RL 章节扩充至 30 QA](memory/agentic-rl-30-qa.md) — 《Agentic-RL —— 从 SFT 到 GRPO 的 LLM 训练实战》已从 10 个 QA 扩充至 30 个 QA 并推送至 master。
 - [智能体通信协议章节扩充至 30 QA](memory/智能体通信协议-30-qa.md) — 《智能体通信协议 —— MCP、A2A、ANP 等协议解析》已从 10 个 QA 扩充至 30 个 QA 并推送至 master。
+- [智能体性能评估章节扩充至 30 QA](memory/智能体性能评估-30-qa.md) — 《智能体性能评估 —— 核心指标、基准测试与评估框架》已从 10 个 QA 扩充至 30 个 QA 并推送至 master。
