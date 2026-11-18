@@ -3,3 +3,4 @@
 - [记忆与检索章节扩充至 35 QA](memory/memory-and-retrieval-35-qa.md) — 《记忆与检索》已从 9 个 QA 扩充至 35 个 QA 并推送至 master。
 - [上下文工程章节扩充至 35 QA](memory/context-engineering-35-qa.md) — 《上下文工程》已从 10 个 QA 扩充至 35 个 QA 并推送至 master。
 - [框架开发实践章节扩充至 30 QA](memory/framework-development-practice-30-qa.md) — 《框架开发实践》已从 10 个 QA 扩充至 30 个 QA 并推送至 master。
+- [Agentic-RL 章节扩充至 30 QA](memory/agentic-rl-30-qa.md) — 《Agentic-RL —— 从 SFT 到 GRPO 的 LLM 训练实战》已从 10 个 QA 扩充至 30 个 QA 并推送至 master。
